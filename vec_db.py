@@ -25,6 +25,7 @@ class VecDB:
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
+            
             # delete the old DB file if exists
             # if os.path.exists(self.db_path):
             #     os.remove(self.db_path)
@@ -78,7 +79,6 @@ class VecDB:
             centroid = self._get_centroid(i)
             sim = self._call_score(centroid, query)
             similarities.append(sim)
-            del centroid
         
         similarities = np.array(similarities)
         n_probes = min(n_probes, n_clusters)
@@ -113,21 +113,34 @@ class VecDB:
         num_records = self._get_num_records()
         n_clusters = self._determine_n_clusters(num_records)
         
-        kmeans = MiniBatchKMeans(
-            n_clusters=n_clusters,
-            batch_size=min_batch_size,
-            random_state=DB_SEED_NUMBER,
-            max_iter=100,
-            n_init=3
-        )
+        best_inertia = float('inf')
+        best_kmeans = None
         
-        batch_size = 50000
-        for batch_start in range(0, num_records, batch_size):
-            batch_end = min(batch_start + batch_size, num_records)
-            batch_vectors = vectors[batch_start:batch_end]
-            kmeans.partial_fit(batch_vectors)
+        n_runs = 5
         
-        centroids = kmeans.cluster_centers_
+        for run in range(n_runs):
+            kmeans = MiniBatchKMeans(
+                n_clusters=n_clusters,
+                batch_size=min_batch_size,
+                random_state=DB_SEED_NUMBER + run,
+                max_iter=300,
+                n_init=1,
+                init='k-means++',
+                reassignment_ratio=0.01,
+                max_no_improvement=20
+            )
+            
+            batch_size = 50000
+            for batch_start in range(0, num_records, batch_size):
+                batch_end = min(batch_start + batch_size, num_records)
+                batch_vectors = vectors[batch_start:batch_end]
+                kmeans.partial_fit(batch_vectors)
+            
+            if kmeans.inertia_ < best_inertia:
+                best_inertia = kmeans.inertia_
+                best_kmeans = kmeans
+        
+        centroids = best_kmeans.cluster_centers_
         centroids /= np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-10
         centroids = centroids.astype(np.float16)
         
@@ -136,7 +149,7 @@ class VecDB:
         for batch_start in range(0, num_records, batch_size):
             batch_end = min(batch_start + batch_size, num_records)
             batch_vectors = vectors[batch_start:batch_end]
-            batch_labels = kmeans.predict(batch_vectors)
+            batch_labels = best_kmeans.predict(batch_vectors)
             
             for i, label in enumerate(batch_labels):
                 inverted_index[label].append(batch_start + i)
@@ -156,25 +169,38 @@ class VecDB:
             start_idx = subspace * self.subvector_dim
             end_idx = (subspace + 1) * self.subvector_dim
             
-            kmeans = MiniBatchKMeans(
-                n_clusters=self.n_patterns,
-                batch_size=10000,
-                random_state=DB_SEED_NUMBER + subspace,
-                max_iter=300,
-                n_init=5
-            )
+            best_inertia = float('inf')
+            best_centers = None
             
-            batch_size = 50000
-            for batch_start in range(0, num_records, batch_size):
-                batch_end = min(batch_start + batch_size, num_records)
-                batch_vectors = vectors[batch_start:batch_end]
-                batch_centroids = index_to_centroid[batch_start:batch_end]
+            n_runs = 5
+            
+            for run in range(n_runs):
+                kmeans = MiniBatchKMeans(
+                    n_clusters=self.n_patterns,
+                    batch_size=10000,
+                    random_state=DB_SEED_NUMBER + subspace + run * 1000,
+                    max_iter=100,
+                    n_init=1,
+                    init='k-means++',
+                    reassignment_ratio=0.01,
+                    max_no_improvement=15
+                )
                 
-                residuals = batch_vectors - batch_centroids
-                subspace_residuals = residuals[:, start_idx:end_idx]
-                kmeans.partial_fit(subspace_residuals)
+                batch_size = 50000
+                for batch_start in range(0, num_records, batch_size):
+                    batch_end = min(batch_start + batch_size, num_records)
+                    batch_vectors = vectors[batch_start:batch_end]
+                    batch_centroids = index_to_centroid[batch_start:batch_end]
+                    
+                    residuals = batch_vectors - batch_centroids
+                    subspace_residuals = residuals[:, start_idx:end_idx]
+                    kmeans.partial_fit(subspace_residuals)
+                
+                if kmeans.inertia_ < best_inertia:
+                    best_inertia = kmeans.inertia_
+                    best_centers = kmeans.cluster_centers_
             
-            pq_codebooks.append(kmeans.cluster_centers_)
+            pq_codebooks.append(best_centers)
         
         for i in range(len(pq_codebooks)):
             pq_codebooks[i] /= (np.linalg.norm(pq_codebooks[i], axis=1, keepdims=True) + 1e-10)
@@ -312,96 +338,54 @@ class VecDB:
             valid_mask = (indices >= 0) & (indices < num_records)
             return indices[valid_mask]
         return None
+    
+    def _compute_pq_distances(self, query_residual, codebooks, local_codes):
+        n_vecs = len(local_codes)
+        dist = np.zeros(n_vecs, dtype=np.float32)
+        query_norms = np.zeros(self.n_subvectors, dtype=np.float32)
+
+        for i in range(self.n_subvectors):
+            start_idx = i * self.subvector_dim
+            end_idx = (i + 1) * self.subvector_dim
+            qr = query_residual[start_idx:end_idx]
+            query_norms[i] = np.dot(qr, qr)
         
-    def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
-        query = np.array(query, dtype=np.float32).flatten()
-        query /= np.linalg.norm(query) + 1e-10
-
-        n_clusters = self._get_n_clusters()
-
-        if n_probes is None:
-            n_probes = max(12, min(80, n_clusters // 6))
-
-        cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
-
-        factor = min(160, max(100, n_clusters // 4)) * 3
-        n_take = top_k * factor
-
-        candidate_heap = []
-
-        codebooks = self._get_pq_codebooks()
-
-        for cid in cluster_ids:
-            indices = self._get_cluster_indices(cid)
-            if indices is None or len(indices) == 0:
-                continue
-
-            local_codes = self._get_cluster_codes(cid)
-            if local_codes is None:
-                del indices
-                continue
-
-            centroid = self._get_centroid(cid)
-            query_residual = query - centroid
-
-            n_vecs = min(len(local_codes), len(indices))
-            local_codes = local_codes[:n_vecs]
-            indices = indices[:n_vecs]
-
-            dist = np.zeros(n_vecs, dtype=np.float16)
-
-            subspace = np.empty(self.n_patterns, dtype=np.float32)
-
+        batch_size = min(5000, n_vecs)
+        
+        for batch_start in range(0, n_vecs, batch_size):
+            batch_end = min(batch_start + batch_size, n_vecs)
+            batch_codes = local_codes[batch_start:batch_end]
+            batch_dist = np.zeros(batch_end - batch_start, dtype=np.float32)
+            
             for i in range(self.n_subvectors):
-                start_idx = i * self.subvector_dim
-                end_idx = (i + 1) * self.subvector_dim
-
-                qr = query_residual[start_idx:end_idx]
                 cb = codebooks[i]
-                if cb is None:
-                    continue
+                code_indices = batch_codes[:, i]
+                cb_vectors = cb[code_indices].astype(np.float32)
+                cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
+                dots = np.dot(cb_vectors, query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim])
+                batch_dist += query_norms[i] + cb_norms - 2 * dots
+            
+            dist[batch_start:batch_end] = batch_dist
+        
+        return dist
+    
+    def _update_candidate_heap(self, heap, distances, indices, n_vecs, n_take):
+        if len(heap) < n_take:
+            needed = n_take - len(heap)
+            take_n = min(needed, n_vecs)
+            top_idxs = np.argpartition(distances, take_n - 1)[:take_n]
+            for j in top_idxs:
+                heapq.heappush(heap, (-float(distances[j]), int(indices[j])))
+        else:
+            threshold = -heap[0][0]
+            mask = distances < threshold
+            for idx_pos in np.where(mask)[0]:
+                d = float(distances[idx_pos])
+                if d < threshold:
+                    heapq.heapreplace(heap, (-d, int(indices[idx_pos])))
+                    threshold = -heap[0][0]
 
-                cb = np.asarray(cb, dtype=np.float32)
-
-                q_norm = float(self._call_score(qr, qr))
-                cb_norm = np.sum(cb * cb, axis=1)
-                dotp = cb @ qr
-
-                subspace[:] = q_norm + cb_norm - 2 * dotp
-                dist += subspace[local_codes[:, i]].astype(np.float16)
-
-            if len(candidate_heap) < n_take:
-                needed = n_take - len(candidate_heap)
-                take_n = min(needed, n_vecs)
-                top_idxs = np.argpartition(dist, take_n - 1)[:take_n]
-                for j in top_idxs:
-                    heapq.heappush(candidate_heap, (-float(dist[j]), int(indices[j])))
-            else:
-                threshold = -candidate_heap[0][0]
-                mask = dist < threshold
-                for idx_pos in np.where(mask)[0]:
-                    d = float(dist[idx_pos])
-                    if d < threshold:
-                        heapq.heapreplace(candidate_heap, (-d, int(indices[idx_pos])))
-                        threshold = -candidate_heap[0][0]
-
-        gc.collect()
-
-        if not candidate_heap:
-            return []
-
-        seen = set()
-        unique_candidates = []
-        for _, idx in candidate_heap:
-            if idx not in seen:
-                seen.add(idx)
-                unique_candidates.append(idx)
-
-        n_keep = int(len(unique_candidates) * 0.95)
-        candidate_ids = unique_candidates[:n_keep]
-
-        del candidate_heap
-
+    def _rerank_candidates(self, candidate_ids, query, top_k):
         final_heap = []
         
         for idx in candidate_ids:
@@ -412,11 +396,60 @@ class VecDB:
             elif sim > final_heap[0][0]:
                 heapq.heapreplace(final_heap, (float(sim), idx))
 
-        del candidate_ids
-        gc.collect()
-
         final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
         return final_results
+    
+    def _get_unique_candidates(self, candidate_heap):
+        seen = set()
+        unique_candidates = []
+
+        for _, idx in candidate_heap:
+            if idx not in seen:
+                seen.add(idx)
+                unique_candidates.append(idx)
+
+        return unique_candidates
+
+    def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
+        query = np.array(query, dtype=np.float32).flatten()
+        query /= np.linalg.norm(query) + 1e-10
+
+        n_clusters = self._get_n_clusters()
+
+        if n_probes is None:
+            n_probes = 44
+
+        n_take = top_k * 500
+
+        cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
+        codebooks = self._get_pq_codebooks()
+
+        candidate_heap = []
+        for cid in cluster_ids:
+            indices = self._get_cluster_indices(cid)
+            if indices is None or len(indices) == 0:
+                continue
+
+            local_codes = self._get_cluster_codes(cid)
+
+            if local_codes is None:
+                continue
+
+            n_vecs = min(len(local_codes), len(indices))
+            if n_vecs == 0:
+                continue
+            
+            centroid = self._get_centroid(cid)
+            query_residual = (query - centroid).astype(np.float32)
+            dist = self._compute_pq_distances(query_residual, codebooks, local_codes[:n_vecs])
+            self._update_candidate_heap(candidate_heap, dist, indices, n_vecs, n_take)
+
+        if not candidate_heap:
+            return []
+        
+        candidate_ids = self._get_unique_candidates(candidate_heap)
+        results = self._rerank_candidates(candidate_ids, query, top_k)
+        return results
 
     def _call_score(self, vec1, vec2):
         return np.dot(vec1, vec2)
