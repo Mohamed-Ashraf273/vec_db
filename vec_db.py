@@ -15,6 +15,7 @@ class VecDB:
         self.dim = DIMENSION
         
         # Index configuration - these are fixed-size values, allowed in init
+        self.db_size = db_size if db_size is not None else 0
         self.n_subvectors = 7
         self.n_patterns = 256
         self.subvector_dim = self.dim // self.n_subvectors
@@ -87,7 +88,6 @@ class VecDB:
     def _ivf_execute(self, vectors, min_batch_size=10000, max_batch_size=50000) -> dict:
         n_vectors = vectors.shape[0]
         n_clusters = self._determine_n_clusters(n_vectors)
-        print(f"IVF: Using {n_clusters} clusters for {n_vectors} vectors.")
         raw_batch_size = 50 * n_clusters
         batch_size = max(min_batch_size, min(raw_batch_size, max_batch_size))
         
@@ -126,7 +126,7 @@ class VecDB:
     def _compute_compressed_codes(self, vectors, pq_codebooks):
         n_vectors = vectors.shape[0]
         compressed_codes = np.memmap(
-            self.index_path + "_codes.dat",
+            self.index_path,
             dtype=np.uint8,
             mode='w+',
             shape=(n_vectors, self.n_subvectors)
@@ -164,17 +164,16 @@ class VecDB:
             'inverted_index': inverted_index,
             'centroids': centroids,
             'pq_codebooks': pq_codebooks,
-            'n_vectors': n_vectors
         }
-        np.save(self.index_path + "_meta.npy", index_meta)
-        
+        np.save(self.index_path.split('.')[0] + "_meta.npy", index_meta)
+
         del vectors
         del compressed_codes
 
     def _load_index_meta(self):
-        index_meta = np.load(self.index_path + "_meta.npy", allow_pickle=True).item()
+        index_meta = np.load(self.index_path.split('.')[0] + "_meta.npy", allow_pickle=True).item()
         return (index_meta['inverted_index'], index_meta['centroids'], 
-                index_meta['pq_codebooks'], index_meta['n_vectors'])
+                index_meta['pq_codebooks'])
 
     def _find_nearest_clusters(self, query, centroids, n_probes):
         similarities = []
@@ -201,7 +200,7 @@ class VecDB:
         if len(query) != self.dim:
             raise ValueError(f"Query dimension {len(query)} != database dimension {self.dim}")
         
-        inverted_index, centroids, pq_codebooks, n_vectors = self._load_index_meta()
+        inverted_index, centroids, pq_codebooks = self._load_index_meta()
         n_clusters = len(centroids)
 
         if n_probes is None:
@@ -215,10 +214,10 @@ class VecDB:
                 candidate_indices.extend(inverted_index[cluster_id])
         
         compressed_codes = np.memmap(
-            self.index_path + "_codes.dat",
+            self.index_path,
             dtype=np.uint8,
             mode='r',
-            shape=(n_vectors, self.n_subvectors)
+            shape=(self.db_size, self.n_subvectors)
         )
         
         pq_candidates = []
