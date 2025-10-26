@@ -229,7 +229,6 @@ class VecDB:
         
         pq_candidates.sort(key=lambda x: x[1])
         candidate_factor = max(10, min(50, n_clusters // 20))
-        print(f"Retrieving top {candidate_factor} candidates for re-ranking.")
         top_pq_candidates = pq_candidates[:top_k * candidate_factor]  # retrieve more for re-ranking
 
         reranked_results = []
