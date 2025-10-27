@@ -54,7 +54,9 @@ def eval(results: List[Result]):
 
 
 if __name__ == "__main__":
-    db = VecDB(db_size = 10**3)
+    size = 10**4
+    print(f"Evaluating VecDB (IVF) with {size} entries")
+    db = VecDB(db_size = size)
 
     all_db = db.get_all_rows()
 

@@ -121,21 +121,20 @@ class VecDB:
         similarities.sort(key=lambda x: x[1], reverse=True)
         return [cluster_id for cluster_id, _ in similarities[:n_probes]]
     
-    def _load_index_data(self):
+    def _load_cluster_indices(self, cluster_id):
         index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='r')
         
         pointer = 0
-        cluster_data = {}
         
-        for cluster_id in range(self.n_clusters):
+        for _ in range(cluster_id):
             cluster_size = index_mmap[pointer]
-            pointer += 1
-            cluster_indices = index_mmap[pointer:pointer + cluster_size]
-            pointer += cluster_size
-            cluster_data[cluster_id] = cluster_indices
+            pointer += 1 + cluster_size
         
-        return cluster_data
-
+        cluster_size = index_mmap[pointer]
+        pointer += 1
+        cluster_indices = index_mmap[pointer:pointer + cluster_size]
+        
+        return np.array(cluster_indices) 
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query).flatten()
@@ -146,23 +145,22 @@ class VecDB:
             n_probes = max(4, min(32, self.n_clusters // 16))
         
         cluster_ids = self._find_nearest_clusters(query, self.centroids, n_probes)
-        cluster_data = self._load_index_data()
 
         candidate_indices = []
         for cluster_id in cluster_ids:
-            if cluster_id in cluster_data:
-                candidate_indices.extend(cluster_data[cluster_id])
+            cluster_indices = self._load_cluster_indices(cluster_id)
+            candidate_indices.extend(cluster_indices)
+        
+        candidate_indices = list(set(candidate_indices))
         
         results = []
         for idx in candidate_indices:
-            original_vector = self.get_one_row(idx)
-            score = self._cal_score(query, original_vector)
+            vector = self.get_one_row(idx)
+            score = self._cal_score(query, vector)
             results.append((idx, score))
         
         results.sort(key=lambda x: x[1], reverse=True)
-        top_k_can = results[: top_k]
-
-        return [idx for idx, _ in top_k_can[:top_k]]
+        return [idx for idx, _ in results[:top_k]]
 
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
