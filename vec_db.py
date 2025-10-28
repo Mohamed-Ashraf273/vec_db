@@ -88,23 +88,40 @@ class VecDB:
     def _ivf_execute(self, vectors, min_batch_size=10000, max_batch_size=50000):
         n_vectors = vectors.shape[0]
         self.n_clusters = self._determine_n_clusters(n_vectors)
+        
         raw_batch_size = 50 * self.n_clusters
         batch_size = max(min_batch_size, min(raw_batch_size, max_batch_size))
-        
-        kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=batch_size, 
+
+        kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=batch_size,
                                 random_state=DB_SEED_NUMBER, max_iter=100, n_init=3)
         labels = kmeans.fit_predict(vectors)
         self.centroids = kmeans.cluster_centers_
 
-        index_structure = []
+        clusters = []
         for cluster_id in range(self.n_clusters):
             cluster_indices = np.where(labels == cluster_id)[0]
-            index_structure.extend([len(cluster_indices)] + list(cluster_indices))
+            clusters.append(cluster_indices)
         
-        index_array = np.array(index_structure, dtype=np.int32)
-        index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='w+', 
-                            shape=index_array.shape)
-        index_mmap[:] = index_array[:]
+        total_size = self.n_clusters + sum(len(cluster) for cluster in clusters) + self.n_clusters
+
+        for cluster in clusters:
+            total_size += len(cluster)
+        
+        index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='w+', shape=(total_size,))
+        
+        header_size = self.n_clusters
+        cluster_offsets = np.zeros(self.n_clusters, dtype=np.int32)
+        
+        current_pos = header_size
+        
+        for cluster_id, cluster_indices in enumerate(clusters):
+            cluster_offsets[cluster_id] = current_pos
+            index_mmap[current_pos] = len(cluster_indices)
+            index_mmap[current_pos + 1: current_pos + 1 + len(cluster_indices)] = cluster_indices
+            current_pos += 1 + len(cluster_indices)
+        
+        index_mmap[0:header_size] = cluster_offsets
+        
         index_mmap.flush()
 
     def _build_index(self):
@@ -121,19 +138,12 @@ class VecDB:
         return [cluster_id for cluster_id, _ in similarities[:n_probes]]
     
     def _load_cluster_indices(self, cluster_id):
-        index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='r')
-        
-        pointer = 0
-        
-        for _ in range(cluster_id):
-            cluster_size = index_mmap[pointer]
-            pointer += 1 + cluster_size
-        
-        cluster_size = index_mmap[pointer]
-        pointer += 1
-        cluster_indices = index_mmap[pointer:pointer + cluster_size]
-        
-        return np.array(cluster_indices) 
+        header_mmap = np.memmap(self.index_path, dtype=np.int32, mode='r', shape=(self.n_clusters,))
+        cluster_offset = header_mmap[cluster_id]
+        full_mmap = np.memmap(self.index_path, dtype=np.int32, mode='r')
+        cluster_size = full_mmap[cluster_offset]
+        cluster_indices = full_mmap[cluster_offset + 1: cluster_offset + 1 + cluster_size]
+        return cluster_indices.copy()
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query).flatten()
