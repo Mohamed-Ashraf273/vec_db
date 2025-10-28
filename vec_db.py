@@ -92,7 +92,7 @@ class VecDB:
         batch_size = max(min_batch_size, min(raw_batch_size, max_batch_size))
         
         kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=batch_size, 
-                                random_state=42, max_iter=100, n_init=3)
+                                random_state=DB_SEED_NUMBER, max_iter=100, n_init=3)
         labels = kmeans.fit_predict(vectors)
         self.centroids = kmeans.cluster_centers_
 
