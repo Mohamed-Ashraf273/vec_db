@@ -19,7 +19,6 @@ class VecDB:
         self.n_subvectors = 7
         self.n_patterns = 256
         self.subvector_dim = self.dim // self.n_subvectors
-        self.n_clusters = None
         
         if new_db:
             if db_size is None:
