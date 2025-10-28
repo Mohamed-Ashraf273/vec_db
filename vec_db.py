@@ -103,9 +103,6 @@ class VecDB:
             clusters.append(cluster_indices)
         
         total_size = self.n_clusters + sum(len(cluster) for cluster in clusters) + self.n_clusters
-
-        for cluster in clusters:
-            total_size += len(cluster)
         
         index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='w+', shape=(total_size,))
         
