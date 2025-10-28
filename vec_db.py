@@ -56,7 +56,7 @@ class VecDB:
 
     def get_one_row(self, row_num: int) -> np.ndarray:
         try:
-            offset = row_num * DIMENSION * ELEMENT_SIZE
+            offset = np.int64(row_num) * np.int64(DIMENSION) * np.int64(ELEMENT_SIZE)
             mmap_vector = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(1, DIMENSION), offset=offset)
             return np.array(mmap_vector[0])
         except Exception as e:
@@ -95,16 +95,18 @@ class VecDB:
         kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=batch_size,
                                 random_state=DB_SEED_NUMBER, max_iter=100, n_init=3)
         labels = kmeans.fit_predict(vectors)
-        self.centroids = kmeans.cluster_centers_
+        centroids = kmeans.cluster_centers_
 
         clusters = []
         for cluster_id in range(self.n_clusters):
             cluster_indices = np.where(labels == cluster_id)[0]
             clusters.append(cluster_indices)
         
-        total_size = self.n_clusters + sum(len(cluster) for cluster in clusters) + self.n_clusters
+        total_cluster_data = self.n_clusters + sum(len(cluster) for cluster in clusters) + self.n_clusters
+        centroids_size = self.n_clusters * self.dim
+        total_size = total_cluster_data + centroids_size
         
-        index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='w+', shape=(total_size,))
+        index_mmap = np.memmap(self.index_path, dtype=np.float32, mode='w+', shape=(total_size,))
         
         header_size = self.n_clusters
         cluster_offsets = np.zeros(self.n_clusters, dtype=np.int32)
@@ -118,6 +120,10 @@ class VecDB:
             current_pos += 1 + len(cluster_indices)
         
         index_mmap[0:header_size] = cluster_offsets
+        
+        centroids_start = current_pos
+        centroids_flat = centroids.flatten()
+        index_mmap[centroids_start:centroids_start + centroids_size] = centroids_flat
         
         index_mmap.flush()
 
@@ -135,22 +141,31 @@ class VecDB:
         return [cluster_id for cluster_id, _ in similarities[:n_probes]]
     
     def _load_cluster_indices(self, cluster_id):
-        header_mmap = np.memmap(self.index_path, dtype=np.int32, mode='r', shape=(self.n_clusters,))
-        cluster_offset = header_mmap[cluster_id]
-        full_mmap = np.memmap(self.index_path, dtype=np.int32, mode='r')
-        cluster_size = full_mmap[cluster_offset]
+        header_mmap = np.memmap(self.index_path, dtype=np.float32, mode='r', shape=(self.n_clusters,))
+        cluster_offset = int(header_mmap[cluster_id])
+        
+        full_mmap = np.memmap(self.index_path, dtype=np.float32, mode='r')
+        cluster_size = int(full_mmap[cluster_offset])
         cluster_indices = full_mmap[cluster_offset + 1: cluster_offset + 1 + cluster_size]
-        return cluster_indices.copy()
+        
+        return cluster_indices.astype(np.int32).copy()
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query).flatten()
         if len(query) != self.dim:
             raise ValueError(f"Query dimension {len(query)} != database dimension {self.dim}")
 
+        index_mmap = np.memmap(self.index_path, dtype=np.float32, mode='r')
+        
+        centroids_size = self.n_clusters * self.dim
+        centroids_start = len(index_mmap) - centroids_size
+        centroids_flat = index_mmap[centroids_start:]
+        centroids = centroids_flat.reshape(self.n_clusters, self.dim)
+
         if n_probes is None:
             n_probes = max(4, min(32, self.n_clusters // 16))
         
-        cluster_ids = self._find_nearest_clusters(query, self.centroids, n_probes)
+        cluster_ids = self._find_nearest_clusters(query, centroids, n_probes)
 
         candidate_indices = []
         for cluster_id in cluster_ids:
