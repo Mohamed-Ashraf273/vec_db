@@ -306,6 +306,14 @@ class VecDB:
             for i in range(self.n_subvectors)
         ]
 
+        subspace_distances = []
+        for i in range(self.n_subvectors):
+            q_chunk = query_chunks[i]
+            codebook = pq_codebooks[i]
+            diff = codebook - q_chunk
+            dists = np.einsum('ij,ij->i', diff, diff)
+            subspace_distances.append(dists)
+
         top_heap = []
         factor = min(250, max(75, n_clusters // 4))
         n_take = top_k * factor
@@ -318,39 +326,46 @@ class VecDB:
 
             local_codes = self._load_cluster_codes(cid)
 
-            dist = np.zeros(len(indices), dtype=np.float32)
-            for subspace in range(self.n_subvectors):
-                q_chunk = query_chunks[subspace]
-                codebook_subspace = pq_codebooks[subspace]
+            dist = np.sum([subspace_distances[i][local_codes[:, i]] for i in range(self.n_subvectors)], axis=0)
 
-                codes = local_codes[:, subspace]
-                patterns = codebook_subspace[codes]
-                diff = patterns - q_chunk
-                dist += np.einsum("ij,ij->i", diff, diff)
-
-            for d, idx in zip(dist, indices):
+            for i in range(len(dist)):
+                d = dist[i]
+                idx = indices[i]
                 if len(top_heap) < n_take:
                     heapq.heappush(top_heap, (-d, idx))
                 elif d < -top_heap[0][0]:
                     heapq.heapreplace(top_heap, (-d, idx))
 
-            del local_codes, dist
+            del local_codes, dist, indices
+
+        del query_chunks, pq_codebooks, centroids, subspace_distances
+        gc.collect()
 
         if not top_heap:
             return []
 
-        top_candidates = np.array([idx for _, idx in top_heap], dtype=np.int32)
-        del top_heap, query_chunks, pq_codebooks
-
-        exact_sims = np.fromiter(
-            (self._cal_score(self.get_one_row(idx), query) for idx in top_candidates),
-            dtype=np.float32,
-            count=len(top_candidates),
-        )
-
-        reranked_idx = np.argsort(exact_sims)[-top_k:][::-1]
-        final_results = top_candidates[reranked_idx].tolist()
-
+        final_heap = []
+        batch_size = 100
+        
+        while top_heap:
+            batch = []
+            for _ in range(min(batch_size, len(top_heap))):
+                if top_heap:
+                    batch.append(heapq.heappop(top_heap))
+            
+            for _, idx in batch:
+                vec = self.get_one_row(idx)
+                sim = np.dot(vec, query)
+                
+                if len(final_heap) < top_k:
+                    heapq.heappush(final_heap, (sim, idx))
+                elif sim > final_heap[0][0]:
+                    heapq.heapreplace(final_heap, (sim, idx))
+                
+                del vec
+        
+        final_results = [idx for _, idx in sorted(final_heap, reverse=True)]
+        
         return final_results
     
     def _cal_score(self, vec1, vec2):
