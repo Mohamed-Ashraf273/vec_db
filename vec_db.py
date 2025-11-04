@@ -161,7 +161,6 @@ class VecDB:
 
     def _compute_compressed_codes(self, vectors, pq_codebooks, inverted_index):
         num_records = self._get_num_records()
-        os.makedirs(self.index_path, exist_ok=True)
         index_to_cluster = {}
         for cluster_id, indices in inverted_index.items():
             for idx in indices:
@@ -212,23 +211,13 @@ class VecDB:
         gc.collect()
 
     def _build_index(self):
+        os.makedirs(self.index_path, exist_ok=True)
         vectors = self.get_all_rows()
         inverted_index, centroids = self._ivf_execute(vectors)
-
         pq_codebooks = self._build_pq_codebooks(vectors)
         self._compute_compressed_codes(vectors, pq_codebooks, inverted_index)
-
-        current_offset = 0
-
-        for cluster_id in range(len(centroids)):
-            indices = inverted_index.get(cluster_id, [])
-            count = len(indices)
-            current_offset += count
-
-        os.makedirs(self.index_path, exist_ok=True)
-
+        
         centroids_path = os.path.join(self.index_path, "centroids.dat")
-
         mmap_centroids = np.memmap(centroids_path, dtype=np.float16, mode='w+', shape=centroids.shape)
         mmap_centroids[:] = centroids[:]
         mmap_centroids.flush()
@@ -356,8 +345,7 @@ class VecDB:
             batch_ids = candidate_ids[i:i+batch_size]
             
             for idx in batch_ids:
-                vec = self.get_one_row(idx)
-                sim = np.dot(query, vec)
+                sim = np.dot(query, self.get_one_row(idx))
                 
                 if len(final_heap) < top_k:
                     heapq.heappush(final_heap, (sim, idx))
@@ -370,7 +358,5 @@ class VecDB:
     
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
-        norm_vec1 = np.linalg.norm(vec1)
-        norm_vec2 = np.linalg.norm(vec2)
-        cosine_similarity = dot_product / (norm_vec1 * norm_vec2)
-        return cosine_similarity
+        norm_product = np.sqrt(np.dot(vec1, vec1) * np.dot(vec2, vec2))
+        return dot_product / (norm_product + 1e-10)
