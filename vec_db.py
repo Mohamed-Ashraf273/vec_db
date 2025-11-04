@@ -286,7 +286,7 @@ class VecDB:
         if os.path.exists(indices_path):
             with open(indices_path, 'rb') as f:
                 data = np.load(f)['deltas']
-                return data.cumsum().astype(np.int32).tolist()
+                return data.cumsum().astype(np.int32)
         return None
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
@@ -326,11 +326,13 @@ class VecDB:
 
             local_codes = self._load_cluster_codes(cid)
 
-            dist = np.sum([subspace_distances[i][local_codes[:, i]] for i in range(self.n_subvectors)], axis=0)
+            dist = subspace_distances[0][local_codes[:, 0]].copy()
+            for i in range(1, self.n_subvectors):
+                dist += subspace_distances[i][local_codes[:, i]]
 
             for i in range(len(dist)):
-                d = dist[i]
-                idx = indices[i]
+                d = float(dist[i])
+                idx = int(indices[i])
                 if len(top_heap) < n_take:
                     heapq.heappush(top_heap, (-d, idx))
                 elif d < -top_heap[0][0]:
@@ -344,25 +346,23 @@ class VecDB:
         if not top_heap:
             return []
 
+        candidate_ids = [idx for _, idx in top_heap]
+        del top_heap
+        
         final_heap = []
         batch_size = 100
         
-        while top_heap:
-            batch = []
-            for _ in range(min(batch_size, len(top_heap))):
-                if top_heap:
-                    batch.append(heapq.heappop(top_heap))
+        for i in range(0, len(candidate_ids), batch_size):
+            batch_ids = candidate_ids[i:i+batch_size]
             
-            for _, idx in batch:
+            for idx in batch_ids:
                 vec = self.get_one_row(idx)
-                sim = np.dot(vec, query)
+                sim = np.dot(query, vec)
                 
                 if len(final_heap) < top_k:
                     heapq.heappush(final_heap, (sim, idx))
                 elif sim > final_heap[0][0]:
                     heapq.heapreplace(final_heap, (sim, idx))
-                
-                del vec
         
         final_results = [idx for _, idx in sorted(final_heap, reverse=True)]
         
