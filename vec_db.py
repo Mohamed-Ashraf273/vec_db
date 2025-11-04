@@ -345,7 +345,8 @@ class VecDB:
             batch_ids = candidate_ids[i:i+batch_size]
             
             for idx in batch_ids:
-                sim = np.dot(query, self.get_one_row(idx))
+                vec = self.get_one_row(idx)
+                sim = np.dot(query, vec)
                 if len(final_heap) < top_k:
                     heapq.heappush(final_heap, (sim, idx))
                 elif sim > final_heap[0][0]:
