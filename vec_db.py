@@ -72,8 +72,15 @@ class VecDB:
         num_records = self._get_num_records()
         return np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
     
-    def _find_nearest_clusters(self, query, centroids, n_probes):
-        similarities = np.array([self._cal_score(c, query) for c in centroids])
+    def _find_nearest_clusters(self, query, n_clusters, n_probes):
+        similarities = []
+        for i in range(n_clusters):
+            centroid = self._get_centroid(i)
+            sim = np.dot(centroid, query)
+            similarities.append(sim)
+            del centroid
+        
+        similarities = np.array(similarities)
         top_clusters = np.argsort(similarities)[-n_probes:][::-1]
         return top_clusters.tolist()
 
@@ -247,10 +254,17 @@ class VecDB:
         del vectors, centroids, pq_codebooks
         gc.collect()
 
-    def _load_index(self):
+    def _get_centroid(self, idx):
         centroids_path = os.path.join(self.index_path, "centroids.dat")
-        centroids = np.memmap(centroids_path, dtype=np.float16, mode='r').reshape(-1, DIMENSION)
-        return centroids
+        offset = idx * DIMENSION * np.dtype(np.float16).itemsize
+        mmap_centroid = np.memmap(centroids_path, dtype=np.float16, mode='r', 
+                                  shape=(DIMENSION,), offset=offset)
+        return np.array(mmap_centroid, dtype=np.float16)
+
+    def _get_n_clusters(self):
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        file_size = os.path.getsize(centroids_path)
+        return file_size // (DIMENSION * np.dtype(np.float16).itemsize)
     
     def _get_pq_codebook(self, subspace_idx):
         cb_path = os.path.join(self.index_path, f"pq_cb_{subspace_idx}.dat")
@@ -308,13 +322,12 @@ class VecDB:
         query = np.array(query, dtype=np.float32).flatten()
         query /= np.linalg.norm(query) + 1e-10
 
-        centroids = self._load_index()
-        n_clusters = centroids.shape[0]
+        n_clusters = self._get_n_clusters()
 
         if n_probes is None:
             n_probes = max(12, min(80, n_clusters // 6))
 
-        cluster_ids = self._find_nearest_clusters(query, centroids, n_probes)
+        cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
 
         subspace_distances = []
         for i in range(self.n_subvectors):
@@ -327,16 +340,14 @@ class VecDB:
                 subspace_distances.append(np.zeros(self.n_patterns, dtype=np.float32))
                 continue
             
-            q_chunk_f32 = q_chunk.astype(np.float32)
             codebook_f32 = codebook.astype(np.float32)
-            
-            q_norm_sq = np.sum(q_chunk_f32 * q_chunk_f32)
+            q_norm_sq = np.dot(q_chunk, q_chunk)
             cb_norm_sq = np.sum(codebook_f32 * codebook_f32, axis=1)
-            dot_product = self._cal_score(codebook_f32, q_chunk_f32)
+            dot_product = np.dot(codebook_f32, q_chunk)
             dists = q_norm_sq + cb_norm_sq - 2 * dot_product
             
-            subspace_distances.append(dists.astype(np.float32))
-            del codebook, codebook_f32
+            subspace_distances.append(dists)
+            del codebook, codebook_f32, cb_norm_sq, dot_product
 
         top_heap = []
         factor = min(250, max(75, n_clusters // 4))
@@ -352,7 +363,9 @@ class VecDB:
                 del indices
                 continue
 
-            dist = subspace_distances[0][local_codes[:, 0]].copy()
+            n_vecs = len(local_codes)
+            dist = np.empty(n_vecs, dtype=np.float32)
+            dist[:] = subspace_distances[0][local_codes[:, 0]]
             for i in range(1, self.n_subvectors):
                 dist += subspace_distances[i][local_codes[:, i]]
 
@@ -371,30 +384,29 @@ class VecDB:
 
             del local_codes, dist, indices
 
-        del centroids, subspace_distances
-        gc.collect()
-
+        del subspace_distances
+        
         if not top_heap:
             return []
 
-        candidate_set = set(idx for _, idx in top_heap)
-        candidate_ids = list(candidate_set)
-        del top_heap, candidate_set
-        gc.collect()
+        seen = {}
+        candidate_ids = []
+        for _, idx in top_heap:
+            if idx not in seen:
+                seen[idx] = True
+                candidate_ids.append(idx)
+        del top_heap, seen
         
         final_heap = []
-        batch_size = 64
+        batch_size = 80
         
         for i in range(0, len(candidate_ids), batch_size):
             batch_ids = candidate_ids[i:i+batch_size]
             self._process_batch(batch_ids, query, final_heap, top_k)
-            del batch_ids
         
         del candidate_ids
-        gc.collect()
         
         final_results = [idx for _, idx in sorted(final_heap, reverse=True)[:top_k]]
-        del final_heap
         
         return final_results
     
