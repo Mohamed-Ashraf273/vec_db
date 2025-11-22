@@ -4,11 +4,7 @@ import os
 import gc
 import math
 import heapq
-import pickle
-
 from sklearn.cluster import MiniBatchKMeans
-from tree_node import TreeNode
-
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -29,8 +25,8 @@ class VecDB:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
             # delete the old DB file if exists
-            if os.path.exists(self.db_path):
-                os.remove(self.db_path)
+            # if os.path.exists(self.db_path):
+            #     os.remove(self.db_path)
 
             if os.path.exists(self.index_path):
                 import shutil
@@ -40,10 +36,10 @@ class VecDB:
             self.generate_database(db_size)
     
     def generate_database(self, size: int) -> None:
-        rng = np.random.default_rng(DB_SEED_NUMBER)
-        vectors = rng.random((size, DIMENSION), dtype=np.float32)
-        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10
-        self._write_vectors_to_file(vectors)
+        # rng = np.random.default_rng(DB_SEED_NUMBER)
+        # vectors = rng.random((size, DIMENSION), dtype=np.float32)
+        # vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10
+        # self._write_vectors_to_file(vectors)
         self._build_index()
 
     def _write_vectors_to_file(self, vectors: np.ndarray) -> None:
@@ -75,6 +71,11 @@ class VecDB:
     def get_all_rows(self) -> np.memmap:
         num_records = self._get_num_records()
         return np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
+    
+    def _find_nearest_clusters(self, query, centroids, n_probes):
+        similarities = np.array([self._cal_score(c, query) for c in centroids])
+        top_clusters = np.argsort(similarities)[-n_probes:][::-1]
+        return top_clusters.tolist()
 
     def _determine_n_clusters(self, n_vectors):
         # Resources:
@@ -93,44 +94,40 @@ class VecDB:
             n_clusters = max(256, min(n_clusters, 4096))
             n_clusters = 2 ** math.ceil(math.log2(n_clusters))
             return min(n_clusters, n_vectors)
+    
+    def _ivf_execute(self, vectors, min_batch_size=10000):
+        num_records = self._get_num_records()
+        n_clusters = self._determine_n_clusters(num_records)
         
-    def _build_tree(self, vectors, indices, depth, max_depth, min_leaf_size=2000):
-        if depth == max_depth or len(indices) <= min_leaf_size:
-            return TreeNode(indices=np.array(indices))
-
-        subset = np.array(vectors[indices])
-
-        mean = np.mean(subset, axis=0)
-        centered = subset - mean
-        
-        if len(subset) > 5000:
-            from sklearn.utils.extmath import randomized_svd
-            _, _, vh = randomized_svd(centered, n_components=1, n_iter=5, random_state=42)
-            direction = vh[0]
-        else:
-            _, _, vh = np.linalg.svd(centered, full_matrices=False)
-            direction = vh[0]
-
-        proj = subset @ direction
-        threshold = np.median(proj)
-
-        left_mask = proj <= threshold
-        right_mask = proj > threshold
-
-        del subset, centered, proj
-        
-        left_indices = np.array(indices)[left_mask]
-        right_indices = np.array(indices)[right_mask]
-
-        left_child = self._build_tree(vectors, left_indices, depth+1, max_depth, min_leaf_size)
-        right_child = self._build_tree(vectors, right_indices, depth+1, max_depth, min_leaf_size)
-
-        return TreeNode(
-            direction=direction,
-            threshold=threshold,
-            left=left_child,
-            right=right_child
+        kmeans = MiniBatchKMeans(
+            n_clusters=n_clusters,
+            batch_size=min_batch_size,
+            random_state=DB_SEED_NUMBER,
+            max_iter=100,
+            n_init=3
         )
+        
+        batch_size = 50000
+        for batch_start in range(0, num_records, batch_size):
+            batch_end = min(batch_start + batch_size, num_records)
+            batch_vectors = vectors[batch_start:batch_end]
+            kmeans.partial_fit(batch_vectors)
+        
+        centroids = kmeans.cluster_centers_
+        centroids /= np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-10
+        centroids = centroids.astype(np.float16)
+        
+        inverted_index = {i: [] for i in range(n_clusters)}
+        
+        for batch_start in range(0, num_records, batch_size):
+            batch_end = min(batch_start + batch_size, num_records)
+            batch_vectors = vectors[batch_start:batch_end]
+            batch_labels = kmeans.predict(batch_vectors)
+            
+            for i, label in enumerate(batch_labels):
+                inverted_index[label].append(batch_start + i)
+        
+        return inverted_index, centroids
 
     def _build_pq_codebooks(self, vectors):
         pq_codebooks = []
@@ -162,79 +159,69 @@ class VecDB:
         
         return pq_codebooks
 
-    def _compute_compressed_codes(self, vectors, pq_codebooks, leaf_index):
+    def _compute_compressed_codes(self, vectors, pq_codebooks, inverted_index):
         num_records = self._get_num_records()
+        index_to_cluster = {}
+        for cluster_id, indices in inverted_index.items():
+            for idx in indices:
+                index_to_cluster[idx] = cluster_id
 
-        leaf_codes_memmap = {}
+        cluster_codes = {}
+        for cluster_id in inverted_index.keys():
+            if inverted_index[cluster_id]:
+                n_vectors_in_cluster = len(inverted_index[cluster_id])
+                cluster_codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
+                cluster_codes[cluster_id] = np.memmap(
+                    cluster_codes_path, dtype=np.uint8, mode='w+',
+                    shape=(n_vectors_in_cluster, self.n_subvectors)
+                )
 
-        for leaf_id, idx_list in leaf_index.items():
-            n_vecs = len(idx_list)
-            path = os.path.join(self.index_path, f"index_codes_{leaf_id}.dat")
-            leaf_codes_memmap[leaf_id] = np.memmap(path, dtype=np.uint8, mode='w+', shape=(n_vecs, self.n_subvectors))
+        cluster_positions = {cluster_id: 0 for cluster_id in inverted_index.keys()}
 
         batch_size = 10000
-
         for batch_start in range(0, num_records, batch_size):
             batch_end = min(batch_start + batch_size, num_records)
             batch_vectors = vectors[batch_start:batch_end]
 
             batch_codes = np.zeros((len(batch_vectors), self.n_subvectors), dtype=np.uint8)
+            for subspace in range(self.n_subvectors):
+                start_dim = subspace * self.subvector_dim
+                end_dim = (subspace + 1) * self.subvector_dim
+                query_chunk = batch_vectors[:, start_dim:end_dim]
+                codebook_subspace = pq_codebooks[subspace]
 
-            for s in range(self.n_subvectors):
-                start = s * self.subvector_dim
-                end = (s + 1) * self.subvector_dim
+                distances = np.linalg.norm(
+                    query_chunk[:, np.newaxis, :] - codebook_subspace[np.newaxis, :, :],
+                    axis=2
+                )
+                batch_codes[:, subspace] = np.argmin(distances, axis=1)
 
-                q = batch_vectors[:, start:end]
-                cb = pq_codebooks[s]
+            for i in range(len(batch_vectors)):
+                global_idx = batch_start + i
+                cluster_id = index_to_cluster.get(global_idx)
+                if cluster_id is not None:
+                    pos = cluster_positions[cluster_id]
+                    cluster_codes[cluster_id][pos] = batch_codes[i]
+                    cluster_positions[cluster_id] += 1
 
-                dists = np.linalg.norm(q[:, None, :] - cb[None, :, :], axis=2)
-                batch_codes[:, s] = np.argmin(dists, axis=1)
-
-            for leaf_id, idx_list in leaf_index.items():
-                mmap = leaf_codes_memmap[leaf_id]
-
-                for pos, global_id in enumerate(idx_list):
-                    if batch_start <= global_id < batch_end:
-                        local = global_id - batch_start
-                        mmap[pos] = batch_codes[local]
-
-        for mmap in leaf_codes_memmap.values():
-            mmap.flush()
-            del mmap
+        for codes_memmap in cluster_codes.values():
+            codes_memmap.flush()
+            del codes_memmap
 
         gc.collect()
-
 
     def _build_index(self):
         os.makedirs(self.index_path, exist_ok=True)
-        
-        num_records = self._get_num_records()
-        vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
-        
-        indices = np.arange(num_records)
-
-        max_depth = int(np.log2(self._determine_n_clusters(num_records)))
-
-        tree_root = self._build_tree(
-            vectors = vectors,
-            indices = indices,
-            depth = 0,
-            max_depth = max_depth
-        )
-
-        leaves = []
-        self._collect_leaves(tree_root, leaves)
-
-        leaf_index = {i: leaf.indices for i, leaf in enumerate(leaves)}
-        
+        vectors = self.get_all_rows()
+        inverted_index, centroids = self._ivf_execute(vectors)
         pq_codebooks = self._build_pq_codebooks(vectors)
+        self._compute_compressed_codes(vectors, pq_codebooks, inverted_index)
         
-        self._compute_compressed_codes(vectors, pq_codebooks, leaf_index)
-        
-        del vectors
-        gc.collect()
-        
-        self._save_tree_structure(tree_root, leaves)
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        mmap_centroids = np.memmap(centroids_path, dtype=np.float16, mode='w+', shape=centroids.shape)
+        mmap_centroids[:] = centroids[:]
+        mmap_centroids.flush()
+        del mmap_centroids
 
         for i, cb in enumerate(pq_codebooks):
             cb_path = os.path.join(self.index_path, f"pq_cb_{i}.dat")
@@ -243,151 +230,172 @@ class VecDB:
             mmap_cb.flush()
             del mmap_cb
 
-        del pq_codebooks
-        gc.collect()
-
         max_uint16 = np.iinfo(np.uint16).max
-        for leaf_id, leaf_indices in leaf_index.items():
-            leaf_indices = np.array(leaf_indices, dtype=np.uint32)
-            leaf_indices.sort()
-
-            diffs = np.diff(leaf_indices, prepend=0)
-
+        for cluster_id, indices in inverted_index.items():
+            indices = np.array(indices, dtype=np.uint32)
+            diffs = np.diff(indices, prepend=0)
+            
             if diffs.max() <= max_uint16:
                 deltas = diffs.astype(np.uint16)
             else:
                 deltas = diffs.astype(np.uint32)
-
-            path = os.path.join(self.index_path, f"deltas_{leaf_id}.dat")
+            
+            path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
             with open(path, 'wb') as f:
                 np.savez_compressed(f, deltas=deltas)
 
-        del leaf_index
+        del vectors, centroids, pq_codebooks
         gc.collect()
 
-
     def _load_index(self):
-        pq_codebooks = []
-        i = 0
-        while True:
-            cb_path = os.path.join(self.index_path, f"pq_cb_{i}.dat")
-            if not os.path.exists(cb_path):
-                break
-            mmap_cb = np.memmap(cb_path, dtype=np.float16, mode='r')
-            n_codewords = int(len(mmap_cb) / self.subvector_dim)
-            pq_codebooks.append(mmap_cb.reshape(n_codewords, self.subvector_dim))
-            i += 1
-
-        return pq_codebooks
-
-    def _compute_pq_distances(self, query, pq_codebooks):
-        query = query.astype(np.float32)
-        distance_tables = []
-
-        for i in range(self.n_subvectors):
-            start = i * self.subvector_dim
-            end = (i + 1) * self.subvector_dim
-            q = query[start:end]
-            cb = pq_codebooks[i].astype(np.float32)
-            numer = cb @ q          
-            sim = numer / (np.linalg.norm(q) + 1e-10)
-            distance_tables.append((1.0 - sim).astype(np.float32))
-        return distance_tables
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        centroids = np.memmap(centroids_path, dtype=np.float16, mode='r').reshape(-1, DIMENSION)
+        return centroids
     
-    def _collect_leaves(self, node, leaf_list):
-        if node.is_leaf():
-            leaf_list.append(node)
-        else:
-            self._collect_leaves(node.left, leaf_list)
-            self._collect_leaves(node.right, leaf_list)
-    
-    def _save_tree_structure(self, tree_root, leaves):
-        tree_path = os.path.join(self.index_path, "tree_structure.pkl")
-        with open(tree_path, 'wb') as f:
-            pickle.dump((tree_root, leaves), f)
-    
-    def _load_tree_structure(self):
-        tree_path = os.path.join(self.index_path, "tree_structure.pkl")
-        if os.path.exists(tree_path):
-            with open(tree_path, 'rb') as f:
-                tree_root, leaves = pickle.load(f)
-                return tree_root, leaves
-        else:
-            raise FileNotFoundError(f"Tree structure not found at {tree_path}")
+    def _get_pq_codebook(self, subspace_idx):
+        cb_path = os.path.join(self.index_path, f"pq_cb_{subspace_idx}.dat")
+        if not os.path.exists(cb_path):
+            return None
+        mmap_cb = np.memmap(cb_path, dtype=np.float16, mode='r')
+        n_codewords = int(len(mmap_cb) / self.subvector_dim)
+        return mmap_cb.reshape(n_codewords, self.subvector_dim)
 
-    def _leaf_center(self, leaf: TreeNode, vectors: np.ndarray) -> np.ndarray:
-        return np.mean(vectors[leaf.indices], axis=0)
+    def _load_cluster_codes(self, cluster_id):
+        codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
+        if os.path.exists(codes_path):
+            return np.fromfile(codes_path, dtype=np.uint8).reshape(-1, self.n_subvectors)
+        return None
     
-    def _compute_leaf_heap(self, leaf_id, leaf_indices, distance_tables, top_heap, n_take, max_batch_size=5000):
-        codes_path = os.path.join(self.index_path, f"index_codes_{leaf_id}.dat")
-        if not os.path.exists(codes_path):
+    def _load_cluster_indices(self, cluster_id):
+        indices_path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
+        if os.path.exists(indices_path):
+            with open(indices_path, 'rb') as f:
+                data = np.load(f)['deltas']
+                return data.cumsum().astype(np.int32)
+        return None
+
+    def _process_batch(self, batch_ids, query, final_heap, top_k):
+        if not batch_ids:
             return
-
-        codes_mmap = np.memmap(codes_path, dtype=np.uint8, mode='r', shape=(len(leaf_indices), self.n_subvectors))
-        total_codes = len(codes_mmap)
-        batch_size = min(max_batch_size, total_codes)
-
-        for batch_start in range(0, total_codes, batch_size):
-            batch_end = min(batch_start + batch_size, total_codes)
-            batch_codes = codes_mmap[batch_start:batch_end]
-            batch_indices = leaf_indices[batch_start:batch_end]
-
-            dist = np.zeros(len(batch_codes), dtype=np.float32)
-            for i in range(self.n_subvectors):
-                dist += distance_tables[i][batch_codes[:, i]]
-
-            m = min(n_take, len(batch_codes))
-            top_local = np.argpartition(dist, m-1)[:m] if m < len(batch_codes) else np.arange(len(batch_codes))
-            for d_val, idx_val in zip(dist[top_local], batch_indices[top_local]):
-                if len(top_heap) < n_take:
-                    heapq.heappush(top_heap, (-d_val, int(idx_val)))
-                elif d_val < -top_heap[0][0]:
-                    heapq.heapreplace(top_heap, (-d_val, int(idx_val)))
+        
+        num_records = self._get_num_records()
+        batch_vectors = []
+        
+        for idx in batch_ids:
+            if idx >= num_records:
+                continue
+            offset = np.int64(idx) * np.int64(DIMENSION) * np.int64(ELEMENT_SIZE)
+            vec = np.memmap(self.db_path, dtype=np.float32, mode='r', 
+                           shape=(DIMENSION,), offset=offset)
+            batch_vectors.append(np.array(vec))
+        
+        if not batch_vectors:
+            return
+        
+        batch_matrix = np.array(batch_vectors, dtype=np.float32)
+        similarities = self._cal_score(batch_matrix, query)
+        
+        for i, idx in enumerate(batch_ids[:len(similarities)]):
+            sim = float(similarities[i])
+            if len(final_heap) < top_k:
+                heapq.heappush(final_heap, (sim, idx))
+            elif sim > final_heap[0][0]:
+                heapq.heapreplace(final_heap, (sim, idx))
+        
+        del batch_vectors, batch_matrix, similarities
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query, dtype=np.float32).flatten()
         query /= np.linalg.norm(query) + 1e-10
 
-        tree_root, leaves = self._load_tree_structure()
-        pq_codebooks = self._load_index()
-        distance_tables = self._compute_pq_distances(query, pq_codebooks)
+        centroids = self._load_index()
+        n_clusters = centroids.shape[0]
 
         if n_probes is None:
-            n_probes = len(leaves)
-        
-        selected_leaves = list(range(min(n_probes, len(leaves))))
+            n_probes = max(12, min(80, n_clusters // 6))
+
+        cluster_ids = self._find_nearest_clusters(query, centroids, n_probes)
+
+        subspace_distances = []
+        for i in range(self.n_subvectors):
+            start_idx = i * self.subvector_dim
+            end_idx = (i + 1) * self.subvector_dim
+            q_chunk = query[start_idx:end_idx]
+            
+            codebook = self._get_pq_codebook(i)
+            if codebook is None:
+                subspace_distances.append(np.zeros(self.n_patterns, dtype=np.float32))
+                continue
+            
+            q_chunk_f32 = q_chunk.astype(np.float32)
+            codebook_f32 = codebook.astype(np.float32)
+            
+            q_norm_sq = np.sum(q_chunk_f32 * q_chunk_f32)
+            cb_norm_sq = np.sum(codebook_f32 * codebook_f32, axis=1)
+            dot_product = self._cal_score(codebook_f32, q_chunk_f32)
+            dists = q_norm_sq + cb_norm_sq - 2 * dot_product
+            
+            subspace_distances.append(dists.astype(np.float32))
+            del codebook, codebook_f32
 
         top_heap = []
-        n_take = min(top_k * 100, 500)
+        factor = min(250, max(75, n_clusters // 4))
+        n_take = top_k * factor
 
-        for leaf_id in selected_leaves:
-            leaf_indices = leaves[leaf_id].indices
-            self._compute_leaf_heap(leaf_id, leaf_indices, distance_tables, top_heap, n_take)
+        for cid in cluster_ids:
+            indices = self._load_cluster_indices(cid)
+            if indices is None or len(indices) == 0:
+                continue
 
-        del distance_tables, pq_codebooks, tree_root, leaves
+            local_codes = self._load_cluster_codes(cid)
+            if local_codes is None:
+                del indices
+                continue
+
+            dist = subspace_distances[0][local_codes[:, 0]].copy()
+            for i in range(1, self.n_subvectors):
+                dist += subspace_distances[i][local_codes[:, i]]
+
+            if len(top_heap) < n_take:
+                for i in range(len(dist)):
+                    heapq.heappush(top_heap, (-float(dist[i]), int(indices[i])))
+                    if len(top_heap) >= n_take:
+                        break
+            else:
+                threshold = -top_heap[0][0]
+                for i in range(len(dist)):
+                    d = float(dist[i])
+                    if d < threshold:
+                        heapq.heapreplace(top_heap, (-d, int(indices[i])))
+                        threshold = -top_heap[0][0]
+
+            del local_codes, dist, indices
+
+        del centroids, subspace_distances
+        gc.collect()
 
         if not top_heap:
             return []
 
-        top_heap.sort(key=lambda x: x[0])
-        candidate_ids = [idx for _, idx in top_heap[:n_take]]
-        del top_heap
-
+        candidate_set = set(idx for _, idx in top_heap)
+        candidate_ids = list(candidate_set)
+        del top_heap, candidate_set
+        gc.collect()
+        
         final_heap = []
-        batch_size = 200
+        batch_size = 64
         
         for i in range(0, len(candidate_ids), batch_size):
             batch_ids = candidate_ids[i:i+batch_size]
-            for idx in batch_ids:
-                vec = self.get_one_row(idx)
-                sim = np.dot(query, vec)
-                
-                if len(final_heap) < top_k:
-                    heapq.heappush(final_heap, (sim, idx))
-                elif sim > final_heap[0][0]:
-                    heapq.heapreplace(final_heap, (sim, idx))
-
-        final_results = [idx for _, idx in sorted(final_heap, reverse=True)]
+            self._process_batch(batch_ids, query, final_heap, top_k)
+            del batch_ids
+        
+        del candidate_ids
+        gc.collect()
+        
+        final_results = [idx for _, idx in sorted(final_heap, reverse=True)[:top_k]]
+        del final_heap
+        
         return final_results
     
     def _cal_score(self, vec1, vec2):
