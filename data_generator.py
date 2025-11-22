@@ -1,0 +1,15 @@
+import numpy as np
+
+def get_all_rows(db_path) -> np.ndarray:
+    vectors = np.memmap(db_path, dtype=np.float32, mode='r', shape=(20*(10**6), 64))
+    return np.array(vectors)
+
+vectors = get_all_rows('OpenSubtitles_en_20M_emb_64.dat')
+
+random_idx = np.random.randint(0, vectors.shape[0], size=15*10**6)
+sampled_vectors = vectors[random_idx]
+np.random.shuffle(sampled_vectors)
+sampled_vectors += np.random.normal(0, 0.01, sampled_vectors.shape)
+
+with open('OpenSubtitles_en_15M_emb_64.dat', 'wb') as f:
+    sampled_vectors.tofile(f)
