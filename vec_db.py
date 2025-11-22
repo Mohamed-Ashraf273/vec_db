@@ -352,34 +352,35 @@ class VecDB:
         distance_tables = self._compute_pq_distances(query, pq_codebooks)
 
         if n_probes is None:
-            n_probes = max(20, min(len(leaves), len(leaves) // 2))
+            n_probes = len(leaves)
         
         selected_leaves = list(range(min(n_probes, len(leaves))))
 
         top_heap = []
-        factor = max(100, min(200, len(leaves) // 3))
-        n_take = top_k * factor
+        n_take = min(top_k * 100, 500)
 
         for leaf_id in selected_leaves:
             leaf_indices = leaves[leaf_id].indices
             self._compute_leaf_heap(leaf_id, leaf_indices, distance_tables, top_heap, n_take)
 
         del distance_tables, pq_codebooks, tree_root, leaves
-        gc.collect()
 
         if not top_heap:
             return []
 
-        candidate_ids = [idx for _, idx in top_heap]
+        top_heap.sort(key=lambda x: x[0])
+        candidate_ids = [idx for _, idx in top_heap[:n_take]]
         del top_heap
 
         final_heap = []
-        batch_size = 100
+        batch_size = 200
+        
         for i in range(0, len(candidate_ids), batch_size):
             batch_ids = candidate_ids[i:i+batch_size]
             for idx in batch_ids:
                 vec = self.get_one_row(idx)
-                sim = self._cal_score(query, vec)
+                sim = np.dot(query, vec)
+                
                 if len(final_heap) < top_k:
                     heapq.heappush(final_heap, (sim, idx))
                 elif sim > final_heap[0][0]:
@@ -389,6 +390,4 @@ class VecDB:
         return final_results
     
     def _cal_score(self, vec1, vec2):
-        dot_product = np.dot(vec1, vec2)
-        norm_product = np.sqrt(np.dot(vec1, vec1) * np.dot(vec2, vec2))
-        return dot_product / (norm_product + 1e-10)
+        return np.dot(vec1, vec2)
