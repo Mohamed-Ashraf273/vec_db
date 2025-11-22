@@ -32,7 +32,7 @@ class VecDB:
                 import shutil
                 shutil.rmtree(self.index_path)
 
-            self.n_patterns = min(128, db_size)
+            self.n_patterns = min(256, db_size)
             self.generate_database(db_size)
     
     def generate_database(self, size: int) -> None:
