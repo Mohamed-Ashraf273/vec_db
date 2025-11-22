@@ -36,7 +36,7 @@ class VecDB:
                 import shutil
                 shutil.rmtree(self.index_path)
 
-            self.n_patterns = min(128, db_size)  # Reduced from 128 for smaller codebook size
+            self.n_patterns = min(128, db_size)
             self.generate_database(db_size)
     
     def generate_database(self, size: int) -> None:
@@ -94,24 +94,31 @@ class VecDB:
             n_clusters = 2 ** math.ceil(math.log2(n_clusters))
             return min(n_clusters, n_vectors)
         
-    def _build_tree(self, vectors, indices, depth, max_depth, min_leaf_size=1000):
+    def _build_tree(self, vectors, indices, depth, max_depth, min_leaf_size=2000):
         if depth == max_depth or len(indices) <= min_leaf_size:
             return TreeNode(indices=np.array(indices))
 
-        subset = vectors[indices]
+        subset = np.array(vectors[indices])
 
         mean = np.mean(subset, axis=0)
         centered = subset - mean
-        u, s, vh = np.linalg.svd(centered, full_matrices=False)
-        direction = vh[0]
+        
+        if len(subset) > 5000:
+            from sklearn.utils.extmath import randomized_svd
+            _, _, vh = randomized_svd(centered, n_components=1, n_iter=5, random_state=42)
+            direction = vh[0]
+        else:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+            direction = vh[0]
 
         proj = subset @ direction
-
         threshold = np.median(proj)
 
         left_mask = proj <= threshold
         right_mask = proj > threshold
 
+        del subset, centered, proj
+        
         left_indices = np.array(indices)[left_mask]
         right_indices = np.array(indices)[right_mask]
 
@@ -200,9 +207,10 @@ class VecDB:
 
     def _build_index(self):
         os.makedirs(self.index_path, exist_ok=True)
-        vectors = self.get_all_rows()
-
+        
         num_records = self._get_num_records()
+        vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
+        
         indices = np.arange(num_records)
 
         max_depth = int(np.log2(self._determine_n_clusters(num_records)))
@@ -217,10 +225,14 @@ class VecDB:
         leaves = []
         self._collect_leaves(tree_root, leaves)
 
-
         leaf_index = {i: leaf.indices for i, leaf in enumerate(leaves)}
+        
         pq_codebooks = self._build_pq_codebooks(vectors)
+        
         self._compute_compressed_codes(vectors, pq_codebooks, leaf_index)
+        
+        del vectors
+        gc.collect()
         
         self._save_tree_structure(tree_root, leaves)
 
@@ -231,8 +243,10 @@ class VecDB:
             mmap_cb.flush()
             del mmap_cb
 
-        max_uint16 = np.iinfo(np.uint16).max
+        del pq_codebooks
+        gc.collect()
 
+        max_uint16 = np.iinfo(np.uint16).max
         for leaf_id, leaf_indices in leaf_index.items():
             leaf_indices = np.array(leaf_indices, dtype=np.uint32)
             leaf_indices.sort()
@@ -248,7 +262,7 @@ class VecDB:
             with open(path, 'wb') as f:
                 np.savez_compressed(f, deltas=deltas)
 
-        del vectors, pq_codebooks
+        del leaf_index
         gc.collect()
 
 
@@ -265,20 +279,6 @@ class VecDB:
             i += 1
 
         return pq_codebooks
-
-    def _load_cluster_codes(self, cluster_id):
-        codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
-        if os.path.exists(codes_path):
-            return np.fromfile(codes_path, dtype=np.uint8).reshape(-1, self.n_subvectors)
-        return None
-    
-    def _load_cluster_indices(self, cluster_id):
-        indices_path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
-        if os.path.exists(indices_path):
-            with open(indices_path, 'rb') as f:
-                data = np.load(f)['deltas']
-                return data.cumsum().astype(np.int32)
-        return None
 
     def _compute_pq_distances(self, query, pq_codebooks):
         query = query.astype(np.float32)
