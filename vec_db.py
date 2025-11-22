@@ -4,12 +4,15 @@ import os
 import gc
 import math
 import heapq
+import pickle
+
 from sklearn.cluster import MiniBatchKMeans
 from tree_node import TreeNode
 
+
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
-DIMENSION = 70
+DIMENSION = 64
 
 class VecDB:
     def __init__(self, database_file_path="saved_db.dat", index_file_path="index.dat", new_db=True, db_size=None) -> None:
@@ -19,7 +22,7 @@ class VecDB:
         
         # Index configuration - these are fixed-size values, allowed in init
         self.db_size = db_size if db_size is not None else 0
-        self.n_subvectors = 7
+        self.n_subvectors = 8
         self.subvector_dim = self.dim // self.n_subvectors
         
         if new_db:
@@ -33,7 +36,7 @@ class VecDB:
                 import shutil
                 shutil.rmtree(self.index_path)
 
-            self.n_patterns = min(256, db_size)
+            self.n_patterns = min(128, db_size)  # Reduced from 128 for smaller codebook size
             self.generate_database(db_size)
     
     def generate_database(self, size: int) -> None:
@@ -51,7 +54,7 @@ class VecDB:
     def _get_num_records(self) -> int:
         return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
 
-    def insert_records(self, rows: Annotated[np.ndarray, (int, 70)]):
+    def insert_records(self, rows: Annotated[np.ndarray, (int, 64)]):
         num_old_records = self._get_num_records()
         num_new_records = len(rows)
         full_shape = (num_old_records + num_new_records, DIMENSION)
@@ -299,13 +302,11 @@ class VecDB:
             self._collect_leaves(node.right, leaf_list)
     
     def _save_tree_structure(self, tree_root, leaves):
-        import pickle
         tree_path = os.path.join(self.index_path, "tree_structure.pkl")
         with open(tree_path, 'wb') as f:
             pickle.dump((tree_root, leaves), f)
     
     def _load_tree_structure(self):
-        import pickle
         tree_path = os.path.join(self.index_path, "tree_structure.pkl")
         if os.path.exists(tree_path):
             with open(tree_path, 'rb') as f:
