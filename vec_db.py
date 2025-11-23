@@ -81,6 +81,8 @@ class VecDB:
             del centroid
         
         similarities = np.array(similarities)
+        n_probes = min(n_probes, n_clusters)
+        
         if n_probes >= n_clusters:
             top_clusters = np.arange(n_clusters)
         else:
@@ -101,9 +103,9 @@ class VecDB:
             n_clusters = 2 ** math.ceil(math.log2(n_clusters))
             return max(1, n_clusters)
         else:
-            base = math.sqrt(n_vectors) * 1.5
+            base = math.sqrt(n_vectors)
             n_clusters = int(base)  
-            n_clusters = max(256, min(n_clusters, 4096))
+            n_clusters = max(256, min(n_clusters, 2048))
             n_clusters = 2 ** math.ceil(math.log2(n_clusters))
             return min(n_clusters, n_vectors)
     
@@ -179,17 +181,6 @@ class VecDB:
                 index_to_cluster[idx] = cluster_id
 
         cluster_codes = {}
-        for cluster_id in inverted_index.keys():
-            if inverted_index[cluster_id]:
-                n_vectors_in_cluster = len(inverted_index[cluster_id])
-                cluster_codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
-                cluster_codes[cluster_id] = np.memmap(
-                    cluster_codes_path, dtype=np.uint8, mode='w+',
-                    shape=(n_vectors_in_cluster, self.n_subvectors)
-                )
-
-        cluster_positions = {cluster_id: 0 for cluster_id in inverted_index.keys()}
-
         batch_size = 10000
         for batch_start in range(0, num_records, batch_size):
             batch_end = min(batch_start + batch_size, num_records)
@@ -212,14 +203,22 @@ class VecDB:
                 global_idx = batch_start + i
                 cluster_id = index_to_cluster.get(global_idx)
                 if cluster_id is not None:
-                    pos = cluster_positions[cluster_id]
-                    cluster_codes[cluster_id][pos] = batch_codes[i]
-                    cluster_positions[cluster_id] += 1
+                    if cluster_id not in cluster_codes:
+                        cluster_codes[cluster_id] = []
+                    cluster_codes[cluster_id].append(batch_codes[i])
 
-        for codes_memmap in cluster_codes.values():
-            codes_memmap.flush()
-            del codes_memmap
-
+        for cluster_id, codes_list in cluster_codes.items():
+            if codes_list:
+                codes_array = np.array(codes_list, dtype=np.uint8)
+                codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
+                
+                if codes_array.nbytes > 50000:
+                    with open(codes_path, 'wb') as f:
+                        np.savez_compressed(f, codes=codes_array)
+                else:
+                    codes_array.tofile(codes_path)
+        
+        del cluster_codes
         gc.collect()
 
     def _build_index(self):
@@ -253,8 +252,7 @@ class VecDB:
                 deltas = diffs.astype(np.uint32)
             
             path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
-            with open(path, 'wb') as f:
-                np.savez_compressed(f, deltas=deltas)
+            deltas.tofile(path)
 
         del vectors, centroids, pq_codebooks
         gc.collect()
@@ -282,15 +280,22 @@ class VecDB:
     def _load_cluster_codes(self, cluster_id):
         codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
         if os.path.exists(codes_path):
-            return np.fromfile(codes_path, dtype=np.uint8).reshape(-1, self.n_subvectors)
+            try:
+                with open(codes_path, 'rb') as f:
+                    data = np.load(f)['codes']
+                    return data
+            except:
+                return np.fromfile(codes_path, dtype=np.uint8).reshape(-1, self.n_subvectors)
         return None
     
     def _load_cluster_indices(self, cluster_id):
         indices_path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
         if os.path.exists(indices_path):
-            with open(indices_path, 'rb') as f:
-                data = np.load(f)['deltas']
-                return data.cumsum().astype(np.int32)
+            deltas = np.fromfile(indices_path, dtype=np.uint16)
+            indices = deltas.cumsum().astype(np.int32)
+            num_records = self._get_num_records()
+            valid_mask = (indices >= 0) & (indices < num_records)
+            return indices[valid_mask]
         return None
 
     def _process_batch(self, batch_ids, query, final_heap, top_k):
@@ -298,7 +303,7 @@ class VecDB:
             return
         
         num_records = self._get_num_records()
-        valid_batch = [idx for idx in batch_ids if idx < num_records]
+        valid_batch = [idx for idx in batch_ids if 0 <= idx < num_records]
         if not valid_batch:
             return
         
@@ -353,7 +358,7 @@ class VecDB:
             subspace_distances.append(dists)
             del codebook, codebook_f32, cb_norm_sq, dot_product
 
-        factor = min(250, max(75, n_clusters // 4))
+        factor = min(150, max(50, n_clusters // 6))
         n_take = top_k * factor
 
         candidate_heap = []
@@ -368,21 +373,24 @@ class VecDB:
                 del indices
                 continue
 
-            n_vecs = len(local_codes)
+            n_vecs = min(len(local_codes), len(indices))
+            local_codes = local_codes[:n_vecs]
+            indices = indices[:n_vecs]
             dist = np.sum([subspace_distances[i][local_codes[:, i]] for i in range(self.n_subvectors)], axis=0)
             
-            heap_size = len(candidate_heap)
-            if heap_size < n_take:
-                for i in range(n_vecs):
+            if len(candidate_heap) < n_take:
+                n_add = min(n_vecs, n_take - len(candidate_heap))
+                for i in range(n_add):
                     heapq.heappush(candidate_heap, (-float(dist[i]), int(indices[i])))
-                    if len(candidate_heap) >= n_take:
-                        break
             else:
                 threshold = -candidate_heap[0][0]
-                for i in range(n_vecs):
-                    d = float(dist[i])
+                better_mask = dist < threshold
+                better_indices = np.where(better_mask)[0]
+                
+                for idx in better_indices:
+                    d = float(dist[idx])
                     if d < threshold:
-                        heapq.heapreplace(candidate_heap, (-d, int(indices[i])))
+                        heapq.heapreplace(candidate_heap, (-d, int(indices[idx])))
                         threshold = -candidate_heap[0][0]
 
             del local_codes, dist, indices
@@ -401,7 +409,7 @@ class VecDB:
         del candidate_heap, seen
         
         final_heap = []
-        batch_size = 128
+        batch_size = 256
         
         for i in range(0, len(candidate_ids), batch_size):
             batch_ids = candidate_ids[i:i+batch_size]
