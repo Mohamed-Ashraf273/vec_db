@@ -1,20 +1,30 @@
 import numpy as np
 
-def get_all_rows(db_path) -> np.ndarray:
-    vectors = np.memmap(db_path, dtype=np.float32, mode='r', shape=(20*(10**6), 64))
-    return np.array(vectors)
+def generate_15M_from_20M(src_path, dst_path):
+    src_vectors = np.memmap(src_path, dtype=np.float32, mode='r', shape=(20*10**6, 64))
+    
+    np.random.seed(42)
+    random_idx = np.random.randint(0, 20*10**6, size=15*10**6)
+    
+    dst_vectors = np.memmap(dst_path, dtype=np.float32, mode='w+', shape=(15*10**6, 64))
+    
+    batch_size = 100000
+    for i in range(0, 15*10**6, batch_size):
+        end_idx = min(i + batch_size, 15*10**6)
+        batch_indices = random_idx[i:end_idx]
+        
+        batch = np.array(src_vectors[batch_indices])
+        batch += np.random.normal(0, 0.01, batch.shape)
+        
+        batch /= np.linalg.norm(batch, axis=1, keepdims=True) + 1e-10
+        
+        dst_vectors[i:end_idx] = batch
+        
+        if (i // batch_size) % 10 == 0:
+            print(f"Progress: {i}/{15*10**6}")
+    
+    dst_vectors.flush()
+    print("Done!")
 
-vectors = get_all_rows('OpenSubtitles_en_20M_emb_64.dat')
-
-random_idx = np.random.randint(0, vectors.shape[0], size=10**7)
-# sample
-sampled_vectors = vectors[random_idx]
-# shuffle
-np.random.shuffle(sampled_vectors)
-# add small noise
-sampled_vectors += np.random.normal(0, 0.01, sampled_vectors.shape)
-# normalize
-sampled_vectors /= np.linalg.norm(sampled_vectors, axis=1, keepdims=True) + 1e-10
-# save
-with open('OpenSubtitles_en_10M_emb_64.dat', 'wb') as f:
-    sampled_vectors.tofile(f)
+if __name__ == "__main__":
+    generate_15M_from_20M('saved_db_20M.dat', 'saved_db_15M.dat')
