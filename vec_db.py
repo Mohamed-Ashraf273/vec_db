@@ -358,7 +358,11 @@ class VecDB:
             subspace_distances.append(dists)
             del codebook, codebook_f32, cb_norm_sq, dot_product
 
-        factor = min(90, max(30, n_clusters // 12))
+        n = self._get_num_records()
+        b = 18.0 / 19.0
+        a = (10**6) * (2 - b)
+        C = a / n + b
+        factor =  int(min(90, max(30, n_clusters // 12)) * C)
         n_take = top_k * factor
 
         candidate_heap = []
