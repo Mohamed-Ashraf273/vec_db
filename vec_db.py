@@ -358,7 +358,7 @@ class VecDB:
             subspace_distances.append(dists)
             del codebook, codebook_f32, cb_norm_sq, dot_product
 
-        factor = min(150, max(50, n_clusters // 6))
+        factor = min(90, max(30, n_clusters // 12))
         n_take = top_k * factor
 
         candidate_heap = []
@@ -417,7 +417,7 @@ class VecDB:
         
         del candidate_ids
         
-        final_results = [idx for _, idx in sorted(final_heap, reverse=True)[:top_k]]
+        final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
         
         return final_results
     
