@@ -329,7 +329,7 @@ class VecDB:
         n_clusters = self._get_n_clusters()
 
         if n_probes is None:
-            n_probes = max(12, min(80, n_clusters // 6))
+            n_probes = max(16, min(80, n_clusters // 3))
 
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
 
