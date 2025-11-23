@@ -81,7 +81,12 @@ class VecDB:
             del centroid
         
         similarities = np.array(similarities)
-        top_clusters = np.argsort(similarities)[-n_probes:][::-1]
+        if n_probes >= n_clusters:
+            top_clusters = np.arange(n_clusters)
+        else:
+            top_clusters = np.argpartition(similarities, -n_probes)[-n_probes:]
+            top_clusters = top_clusters[np.argsort(similarities[top_clusters])[::-1]]
+        
         return top_clusters.tolist()
 
     def _determine_n_clusters(self, n_vectors):
@@ -293,30 +298,29 @@ class VecDB:
             return
         
         num_records = self._get_num_records()
-        batch_vectors = []
+        valid_batch = [idx for idx in batch_ids if idx < num_records]
+        if not valid_batch:
+            return
         
-        for idx in batch_ids:
-            if idx >= num_records:
-                continue
+        batch_size = len(valid_batch)
+        batch_vectors = np.empty((batch_size, DIMENSION), dtype=np.float32)
+        
+        for i, idx in enumerate(valid_batch):
             offset = np.int64(idx) * np.int64(DIMENSION) * np.int64(ELEMENT_SIZE)
             vec = np.memmap(self.db_path, dtype=np.float32, mode='r', 
                            shape=(DIMENSION,), offset=offset)
-            batch_vectors.append(np.array(vec))
+            batch_vectors[i] = vec
         
-        if not batch_vectors:
-            return
+        similarities = np.dot(batch_vectors, query)
         
-        batch_matrix = np.array(batch_vectors, dtype=np.float32)
-        similarities = self._cal_score(batch_matrix, query)
-        
-        for i, idx in enumerate(batch_ids[:len(similarities)]):
+        for i, idx in enumerate(valid_batch):
             sim = float(similarities[i])
             if len(final_heap) < top_k:
                 heapq.heappush(final_heap, (sim, idx))
             elif sim > final_heap[0][0]:
                 heapq.heapreplace(final_heap, (sim, idx))
         
-        del batch_vectors, batch_matrix, similarities
+        del batch_vectors, similarities
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query, dtype=np.float32).flatten()
@@ -349,10 +353,11 @@ class VecDB:
             subspace_distances.append(dists)
             del codebook, codebook_f32, cb_norm_sq, dot_product
 
-        top_heap = []
         factor = min(250, max(75, n_clusters // 4))
         n_take = top_k * factor
 
+        candidate_heap = []
+        
         for cid in cluster_ids:
             indices = self._load_cluster_indices(cid)
             if indices is None or len(indices) == 0:
@@ -364,41 +369,39 @@ class VecDB:
                 continue
 
             n_vecs = len(local_codes)
-            dist = np.empty(n_vecs, dtype=np.float32)
-            dist[:] = subspace_distances[0][local_codes[:, 0]]
-            for i in range(1, self.n_subvectors):
-                dist += subspace_distances[i][local_codes[:, i]]
-
-            if len(top_heap) < n_take:
-                for i in range(len(dist)):
-                    heapq.heappush(top_heap, (-float(dist[i]), int(indices[i])))
-                    if len(top_heap) >= n_take:
+            dist = np.sum([subspace_distances[i][local_codes[:, i]] for i in range(self.n_subvectors)], axis=0)
+            
+            heap_size = len(candidate_heap)
+            if heap_size < n_take:
+                for i in range(n_vecs):
+                    heapq.heappush(candidate_heap, (-float(dist[i]), int(indices[i])))
+                    if len(candidate_heap) >= n_take:
                         break
             else:
-                threshold = -top_heap[0][0]
-                for i in range(len(dist)):
+                threshold = -candidate_heap[0][0]
+                for i in range(n_vecs):
                     d = float(dist[i])
                     if d < threshold:
-                        heapq.heapreplace(top_heap, (-d, int(indices[i])))
-                        threshold = -top_heap[0][0]
+                        heapq.heapreplace(candidate_heap, (-d, int(indices[i])))
+                        threshold = -candidate_heap[0][0]
 
             del local_codes, dist, indices
 
         del subspace_distances
         
-        if not top_heap:
+        if not candidate_heap:
             return []
 
-        seen = {}
+        seen = set()
         candidate_ids = []
-        for _, idx in top_heap:
+        for _, idx in candidate_heap:
             if idx not in seen:
-                seen[idx] = True
+                seen.add(idx)
                 candidate_ids.append(idx)
-        del top_heap, seen
+        del candidate_heap, seen
         
         final_heap = []
-        batch_size = 80
+        batch_size = 128
         
         for i in range(0, len(candidate_ids), batch_size):
             batch_ids = candidate_ids[i:i+batch_size]
