@@ -245,12 +245,12 @@ class VecDB:
         mmap_centroids.flush()
         del mmap_centroids
 
-        for i, cb in enumerate(pq_codebooks):
-            cb_path = os.path.join(self.index_path, f"pq_cb_{i}.dat")
-            mmap_cb = np.memmap(cb_path, dtype=np.float16, mode='w+', shape=cb.shape)
-            mmap_cb[:] = cb[:]
-            mmap_cb.flush()
-            del mmap_cb
+        pq_codebooks_array = np.stack(pq_codebooks)
+        cb_path = os.path.join(self.index_path, "pq_cb.dat")
+        mmap_cb = np.memmap(cb_path, dtype=np.float16, mode='w+', shape=pq_codebooks_array.shape)
+        mmap_cb[:] = pq_codebooks_array[:]
+        mmap_cb.flush()
+        del mmap_cb
 
         max_uint16 = np.iinfo(np.uint16).max
         for cluster_id, indices in inverted_index.items():
@@ -280,15 +280,17 @@ class VecDB:
         file_size = os.path.getsize(centroids_path)
         return file_size // (DIMENSION * np.dtype(np.float16).itemsize)
     
-    def _get_pq_codebook(self, subspace_idx):
-        cb_path = os.path.join(self.index_path, f"pq_cb_{subspace_idx}.dat")
+    def _get_pq_codebooks(self):
+        cb_path = os.path.join(self.index_path, "pq_cb.dat")
         if not os.path.exists(cb_path):
             return None
-        mmap_cb = np.memmap(cb_path, dtype=np.float16, mode='r', 
-                           shape=(self.n_patterns, self.subvector_dim))
-        return np.array(mmap_cb, dtype=np.float16)
+        
+        all_codebooks = np.memmap(cb_path, dtype=np.float16, mode='r', 
+                                shape=(self.n_subvectors, self.n_patterns, self.subvector_dim))
+        
+        return np.array(all_codebooks, dtype=np.float16)
 
-    def _load_cluster_codes(self, cluster_id):
+    def _get_cluster_codes(self, cluster_id):
         codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
         if not os.path.exists(codes_path):
             return None
@@ -298,7 +300,7 @@ class VecDB:
         mmap_codes = np.memmap(codes_path, dtype=np.uint8, mode='r', shape=(n_rows, self.n_subvectors))
         return np.array(mmap_codes, dtype=np.uint8)
         
-    def _load_cluster_indices(self, cluster_id):
+    def _get_cluster_indices(self, cluster_id):
         indices_path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
         if os.path.exists(indices_path):
             deltas = np.fromfile(indices_path, dtype=np.uint16)
@@ -307,26 +309,6 @@ class VecDB:
             valid_mask = (indices >= 0) & (indices < num_records)
             return indices[valid_mask]
         return None
-
-    def _process_batch(self, batch_ids, query, final_heap, top_k):
-        if not batch_ids:
-            return
-
-        dim = DIMENSION
-        batch_size = len(batch_ids)
-
-        batch_vectors = np.empty((batch_size, dim), dtype=np.float16)
-
-        for i, idx in enumerate(batch_ids):
-            batch_vectors[i] = self.get_one_row(idx)
-
-        sims = batch_vectors.astype(np.float32) @ query
-
-        for sim, idx in zip(sims, batch_ids):
-            if len(final_heap) < top_k:
-                heapq.heappush(final_heap, (float(sim), idx))
-            elif sim > final_heap[0][0]:
-                heapq.heapreplace(final_heap, (float(sim), idx))
         
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query, dtype=np.float32).flatten()
@@ -344,14 +326,14 @@ class VecDB:
 
         candidate_heap = []
 
-        codebooks = [self._get_pq_codebook(i) for i in range(self.n_subvectors)]
+        codebooks = self._get_pq_codebooks()
 
         for cid in cluster_ids:
-            indices = self._load_cluster_indices(cid)
+            indices = self._get_cluster_indices(cid)
             if indices is None or len(indices) == 0:
                 continue
 
-            local_codes = self._load_cluster_codes(cid)
+            local_codes = self._get_cluster_codes(cid)
             if local_codes is None:
                 del indices
                 continue
@@ -405,21 +387,27 @@ class VecDB:
         if not candidate_heap:
             return []
 
-        candidate_array = np.array([idx for _, idx in candidate_heap], dtype=np.uint32)
-        candidate_ids = np.unique(candidate_array).tolist()
+        seen = set()
+        unique_candidates = []
+        for _, idx in candidate_heap:
+            if idx not in seen:
+                seen.add(idx)
+                unique_candidates.append(idx)
 
-        prune_frac = 0.1
-        keep_n = int(len(candidate_ids) * (1 - prune_frac))
-        candidate_ids = candidate_ids[:keep_n] 
+        n_keep = int(len(unique_candidates) * 0.9)
+        candidate_ids = unique_candidates[:n_keep]
 
         del candidate_heap
 
         final_heap = []
-        batch_size = 200
-
-        for i in range(0, len(candidate_ids), batch_size):
-            batch_ids = candidate_ids[i:i+batch_size]
-            self._process_batch(batch_ids, query, final_heap, top_k)
+        
+        for idx in candidate_ids:
+            vec = self.get_one_row(idx)
+            sim = self._call_score(vec, query)
+            if len(final_heap) < top_k:
+                heapq.heappush(final_heap, (float(sim), idx))
+            elif sim > final_heap[0][0]:
+                heapq.heapreplace(final_heap, (float(sim), idx))
 
         del candidate_ids
         gc.collect()
