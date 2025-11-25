@@ -224,10 +224,12 @@ class VecDB:
             if codes_list:
                 codes_array = np.array(codes_list, dtype=np.uint8)
                 codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
-                mmap_codes = np.memmap(codes_path, dtype=np.uint8, mode='w+', shape=codes_array.shape)
-                mmap_codes[:] = codes_array[:]
-                mmap_codes.flush()
-                del mmap_codes
+
+                if codes_array.nbytes > 50000:
+                    with open(codes_path, 'wb') as f:
+                        np.savez_compressed(f, codes=codes_array)
+                else:
+                    codes_array.tofile(codes_path)
         
         del cluster_codes
         gc.collect()
@@ -292,13 +294,14 @@ class VecDB:
 
     def _get_cluster_codes(self, cluster_id):
         codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
-        if not os.path.exists(codes_path):
-            return None
-        
-        file_size = os.path.getsize(codes_path)
-        n_rows = file_size // (self.n_subvectors * np.dtype(np.uint8).itemsize)
-        mmap_codes = np.memmap(codes_path, dtype=np.uint8, mode='r', shape=(n_rows, self.n_subvectors))
-        return np.array(mmap_codes, dtype=np.uint8)
+        if os.path.exists(codes_path):
+            try:
+                with open(codes_path, 'rb') as f:
+                    data = np.load(f)['codes']
+                    return data
+            except:
+                return np.fromfile(codes_path, dtype=np.uint8).reshape(-1, self.n_subvectors)
+        return None
         
     def _get_cluster_indices(self, cluster_id):
         indices_path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
@@ -394,7 +397,7 @@ class VecDB:
                 seen.add(idx)
                 unique_candidates.append(idx)
 
-        n_keep = int(len(unique_candidates) * 0.9)
+        n_keep = int(len(unique_candidates) * 0.95)
         candidate_ids = unique_candidates[:n_keep]
 
         del candidate_heap
