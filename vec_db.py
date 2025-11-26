@@ -312,6 +312,79 @@ class VecDB:
             valid_mask = (indices >= 0) & (indices < num_records)
             return indices[valid_mask]
         return None
+    
+    def _compute_pq_distances(self, query_residual, codebooks, local_codes):
+        n_vecs = len(local_codes)
+        dist = np.zeros(n_vecs, dtype=np.float32)
+        batch_size = min(5000, n_vecs)
+        
+        for batch_start in range(0, n_vecs, batch_size):
+            batch_end = min(batch_start + batch_size, n_vecs)
+            batch_size_actual = batch_end - batch_start
+            batch_codes = local_codes[batch_start:batch_end]
+            
+            batch_dist = np.zeros(batch_size_actual, dtype=np.float32)
+            
+            for i in range(self.n_subvectors):
+                start_idx = i * self.subvector_dim
+                end_idx = (i + 1) * self.subvector_dim
+                
+                qr = query_residual[start_idx:end_idx].astype(np.float32)
+                cb = codebooks[i].astype(np.float32)
+                
+                code_indices = batch_codes[:, i]
+                cb_vectors = cb[code_indices]
+                
+                q_norm = np.dot(qr, qr)
+                cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
+                dots = np.dot(cb_vectors, qr)
+                
+                batch_dist += q_norm + cb_norms - 2 * dots
+            
+            dist[batch_start:batch_end] = batch_dist
+        
+        return dist
+    
+    def _update_candidate_heap(self, heap, distances, indices, n_vecs, n_take):
+        if len(heap) < n_take:
+            needed = n_take - len(heap)
+            take_n = min(needed, n_vecs)
+            top_idxs = np.argpartition(distances, take_n - 1)[:take_n]
+            for j in top_idxs:
+                heapq.heappush(heap, (-float(distances[j]), int(indices[j])))
+        else:
+            threshold = -heap[0][0]
+            mask = distances < threshold
+            for idx_pos in np.where(mask)[0]:
+                d = float(distances[idx_pos])
+                if d < threshold:
+                    heapq.heapreplace(heap, (-d, int(indices[idx_pos])))
+                    threshold = -heap[0][0]
+
+    def _rerank_candidates(self, candidate_ids, query, top_k):
+        final_heap = []
+        
+        for idx in candidate_ids:
+            vec = self.get_one_row(idx)
+            sim = self._call_score(vec, query)
+            if len(final_heap) < top_k:
+                heapq.heappush(final_heap, (float(sim), idx))
+            elif sim > final_heap[0][0]:
+                heapq.heapreplace(final_heap, (float(sim), idx))
+
+        final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
+        return final_results
+    
+    def _prune_candidates(self, candidate_heap):
+        seen = set()
+        unique_candidates = []
+        for _, idx in candidate_heap:
+            if idx not in seen:
+                seen.add(idx)
+                unique_candidates.append(idx)
+
+        n_keep = int(len(unique_candidates) * 0.95)
+        return unique_candidates[:n_keep]
         
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query, dtype=np.float32).flatten()
@@ -337,86 +410,30 @@ class VecDB:
                 continue
 
             local_codes = self._get_cluster_codes(cid)
+
             if local_codes is None:
-                del indices
                 continue
 
-            centroid = self._get_centroid(cid)
-            query_residual = query - centroid
-
             n_vecs = min(len(local_codes), len(indices))
-            local_codes = local_codes[:n_vecs]
-            indices = indices[:n_vecs]
-
-            dist = np.zeros(n_vecs, dtype=np.float16)
-
-            subspace = np.empty(self.n_patterns, dtype=np.float32)
-
-            for i in range(self.n_subvectors):
-                start_idx = i * self.subvector_dim
-                end_idx = (i + 1) * self.subvector_dim
-
-                qr = query_residual[start_idx:end_idx]
-                cb = codebooks[i]
-                if cb is None:
-                    continue
-
-                cb = np.asarray(cb, dtype=np.float32)
-
-                q_norm = float(self._call_score(qr, qr))
-                cb_norm = np.sum(cb * cb, axis=1)
-                dotp = cb @ qr
-
-                subspace[:] = q_norm + cb_norm - 2 * dotp
-                dist += subspace[local_codes[:, i]].astype(np.float16)
-
-            if len(candidate_heap) < n_take:
-                needed = n_take - len(candidate_heap)
-                take_n = min(needed, n_vecs)
-                top_idxs = np.argpartition(dist, take_n - 1)[:take_n]
-                for j in top_idxs:
-                    heapq.heappush(candidate_heap, (-float(dist[j]), int(indices[j])))
-            else:
-                threshold = -candidate_heap[0][0]
-                mask = dist < threshold
-                for idx_pos in np.where(mask)[0]:
-                    d = float(dist[idx_pos])
-                    if d < threshold:
-                        heapq.heapreplace(candidate_heap, (-d, int(indices[idx_pos])))
-                        threshold = -candidate_heap[0][0]
-
-        gc.collect()
+            if n_vecs == 0:
+                continue
+            
+            centroid = self._get_centroid(cid)
+            query_residual = (query - centroid).astype(np.float32)
+            dist = self._compute_pq_distances(query_residual, codebooks, local_codes[:n_vecs])
+            self._update_candidate_heap(candidate_heap, dist, indices, n_vecs, n_take)
 
         if not candidate_heap:
             return []
-
-        seen = set()
-        unique_candidates = []
-        for _, idx in candidate_heap:
-            if idx not in seen:
-                seen.add(idx)
-                unique_candidates.append(idx)
-
-        n_keep = int(len(unique_candidates) * 0.95)
-        candidate_ids = unique_candidates[:n_keep]
-
-        del candidate_heap
-
-        final_heap = []
         
-        for idx in candidate_ids:
-            vec = self.get_one_row(idx)
-            sim = self._call_score(vec, query)
-            if len(final_heap) < top_k:
-                heapq.heappush(final_heap, (float(sim), idx))
-            elif sim > final_heap[0][0]:
-                heapq.heapreplace(final_heap, (float(sim), idx))
-
+        candidate_ids = self._prune_candidates(candidate_heap)
+        del candidate_heap, dist, codebooks, centroid, query_residual, indices, local_codes
+        gc.collect()
+        
+        results = self._rerank_candidates(candidate_ids, query, top_k)
         del candidate_ids
         gc.collect()
-
-        final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
-        return final_results
+        return results
 
     def _call_score(self, vec1, vec2):
         return np.dot(vec1, vec2)
