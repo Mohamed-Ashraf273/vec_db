@@ -113,21 +113,34 @@ class VecDB:
         num_records = self._get_num_records()
         n_clusters = self._determine_n_clusters(num_records)
         
-        kmeans = MiniBatchKMeans(
-            n_clusters=n_clusters,
-            batch_size=min_batch_size,
-            random_state=DB_SEED_NUMBER,
-            max_iter=100,
-            n_init=3
-        )
+        best_inertia = float('inf')
+        best_kmeans = None
         
-        batch_size = 50000
-        for batch_start in range(0, num_records, batch_size):
-            batch_end = min(batch_start + batch_size, num_records)
-            batch_vectors = vectors[batch_start:batch_end]
-            kmeans.partial_fit(batch_vectors)
+        n_runs = 2
         
-        centroids = kmeans.cluster_centers_
+        for run in range(n_runs):
+            kmeans = MiniBatchKMeans(
+                n_clusters=n_clusters,
+                batch_size=min_batch_size,
+                random_state=DB_SEED_NUMBER + run,
+                max_iter=300,
+                n_init=1,
+                init='k-means++',
+                reassignment_ratio=0.01,
+                max_no_improvement=20
+            )
+            
+            batch_size = 50000
+            for batch_start in range(0, num_records, batch_size):
+                batch_end = min(batch_start + batch_size, num_records)
+                batch_vectors = vectors[batch_start:batch_end]
+                kmeans.partial_fit(batch_vectors)
+            
+            if kmeans.inertia_ < best_inertia:
+                best_inertia = kmeans.inertia_
+                best_kmeans = kmeans
+        
+        centroids = best_kmeans.cluster_centers_
         centroids /= np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-10
         centroids = centroids.astype(np.float16)
         
@@ -136,7 +149,7 @@ class VecDB:
         for batch_start in range(0, num_records, batch_size):
             batch_end = min(batch_start + batch_size, num_records)
             batch_vectors = vectors[batch_start:batch_end]
-            batch_labels = kmeans.predict(batch_vectors)
+            batch_labels = best_kmeans.predict(batch_vectors)
             
             for i, label in enumerate(batch_labels):
                 inverted_index[label].append(batch_start + i)
@@ -160,8 +173,8 @@ class VecDB:
                 n_clusters=self.n_patterns,
                 batch_size=10000,
                 random_state=DB_SEED_NUMBER + subspace,
-                max_iter=300,
-                n_init=5
+                max_iter=100,
+                n_init=3
             )
             
             batch_size = 50000
@@ -316,30 +329,30 @@ class VecDB:
     def _compute_pq_distances(self, query_residual, codebooks, local_codes):
         n_vecs = len(local_codes)
         dist = np.zeros(n_vecs, dtype=np.float32)
+        
+        query_norms = np.zeros(self.n_subvectors, dtype=np.float32)
+        for i in range(self.n_subvectors):
+            start_idx = i * self.subvector_dim
+            end_idx = (i + 1) * self.subvector_dim
+            qr = query_residual[start_idx:end_idx]
+            query_norms[i] = np.dot(qr, qr)
+        
         batch_size = min(5000, n_vecs)
         
         for batch_start in range(0, n_vecs, batch_size):
             batch_end = min(batch_start + batch_size, n_vecs)
-            batch_size_actual = batch_end - batch_start
             batch_codes = local_codes[batch_start:batch_end]
-            
-            batch_dist = np.zeros(batch_size_actual, dtype=np.float32)
+            batch_dist = np.zeros(batch_end - batch_start, dtype=np.float32)
             
             for i in range(self.n_subvectors):
-                start_idx = i * self.subvector_dim
-                end_idx = (i + 1) * self.subvector_dim
-                
-                qr = query_residual[start_idx:end_idx].astype(np.float32)
-                cb = codebooks[i].astype(np.float32)
-                
+                cb = codebooks[i]
                 code_indices = batch_codes[:, i]
-                cb_vectors = cb[code_indices]
+                cb_vectors = cb[code_indices].astype(np.float32)
                 
-                q_norm = np.dot(qr, qr)
                 cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
-                dots = np.dot(cb_vectors, qr)
+                dots = np.dot(cb_vectors, query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim])
                 
-                batch_dist += q_norm + cb_norms - 2 * dots
+                batch_dist += query_norms[i] + cb_norms - 2 * dots
             
             dist[batch_start:batch_end] = batch_dist
         
@@ -375,7 +388,7 @@ class VecDB:
         final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
         return final_results
     
-    def _prune_candidates(self, candidate_heap):
+    def _get_unique_candidates(self, candidate_heap):
         seen = set()
         unique_candidates = []
         for _, idx in candidate_heap:
@@ -383,9 +396,8 @@ class VecDB:
                 seen.add(idx)
                 unique_candidates.append(idx)
 
-        n_keep = int(len(unique_candidates) * 0.95)
-        return unique_candidates[:n_keep]
-        
+        return unique_candidates
+
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
         query = np.array(query, dtype=np.float32).flatten()
         query /= np.linalg.norm(query) + 1e-10
@@ -393,7 +405,7 @@ class VecDB:
         n_clusters = self._get_n_clusters()
 
         if n_probes is None:
-            n_probes = max(12, min(80, n_clusters // 6))
+            n_probes = max(8, min(50, n_clusters // 12))
 
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
 
@@ -426,7 +438,7 @@ class VecDB:
         if not candidate_heap:
             return []
         
-        candidate_ids = self._prune_candidates(candidate_heap)
+        candidate_ids = self._get_unique_candidates(candidate_heap)
         del candidate_heap, dist, codebooks, centroid, query_residual, indices, local_codes
         gc.collect()
         
