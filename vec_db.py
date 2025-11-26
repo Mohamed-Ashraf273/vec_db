@@ -25,6 +25,7 @@ class VecDB:
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
+            
             # delete the old DB file if exists
             # if os.path.exists(self.db_path):
             #     os.remove(self.db_path)
@@ -116,7 +117,7 @@ class VecDB:
         best_inertia = float('inf')
         best_kmeans = None
         
-        n_runs = 2
+        n_runs = 5
         
         for run in range(n_runs):
             kmeans = MiniBatchKMeans(
@@ -169,25 +170,38 @@ class VecDB:
             start_idx = subspace * self.subvector_dim
             end_idx = (subspace + 1) * self.subvector_dim
             
-            kmeans = MiniBatchKMeans(
-                n_clusters=self.n_patterns,
-                batch_size=10000,
-                random_state=DB_SEED_NUMBER + subspace,
-                max_iter=100,
-                n_init=3
-            )
+            best_inertia = float('inf')
+            best_centers = None
             
-            batch_size = 50000
-            for batch_start in range(0, num_records, batch_size):
-                batch_end = min(batch_start + batch_size, num_records)
-                batch_vectors = vectors[batch_start:batch_end]
-                batch_centroids = index_to_centroid[batch_start:batch_end]
+            n_runs = 5
+            
+            for run in range(n_runs):
+                kmeans = MiniBatchKMeans(
+                    n_clusters=self.n_patterns,
+                    batch_size=10000,
+                    random_state=DB_SEED_NUMBER + subspace + run * 1000,
+                    max_iter=100,
+                    n_init=1,
+                    init='k-means++',
+                    reassignment_ratio=0.01,
+                    max_no_improvement=15
+                )
                 
-                residuals = batch_vectors - batch_centroids
-                subspace_residuals = residuals[:, start_idx:end_idx]
-                kmeans.partial_fit(subspace_residuals)
+                batch_size = 50000
+                for batch_start in range(0, num_records, batch_size):
+                    batch_end = min(batch_start + batch_size, num_records)
+                    batch_vectors = vectors[batch_start:batch_end]
+                    batch_centroids = index_to_centroid[batch_start:batch_end]
+                    
+                    residuals = batch_vectors - batch_centroids
+                    subspace_residuals = residuals[:, start_idx:end_idx]
+                    kmeans.partial_fit(subspace_residuals)
+                
+                if kmeans.inertia_ < best_inertia:
+                    best_inertia = kmeans.inertia_
+                    best_centers = kmeans.cluster_centers_
             
-            pq_codebooks.append(kmeans.cluster_centers_)
+            pq_codebooks.append(best_centers)
         
         for i in range(len(pq_codebooks)):
             pq_codebooks[i] /= (np.linalg.norm(pq_codebooks[i], axis=1, keepdims=True) + 1e-10)
@@ -405,17 +419,13 @@ class VecDB:
         n_clusters = self._get_n_clusters()
 
         if n_probes is None:
-            n_probes = max(8, min(45, n_clusters // 12))
+            n_probes = 44
 
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
-
-        factor = min(160, max(100, n_clusters // 4)) * 3
-        n_take = top_k * factor
-
-        candidate_heap = []
-
         codebooks = self._get_pq_codebooks()
 
+        n_take = top_k * 485
+        candidate_heap = []
         for cid in cluster_ids:
             indices = self._get_cluster_indices(cid)
             if indices is None or len(indices) == 0:
