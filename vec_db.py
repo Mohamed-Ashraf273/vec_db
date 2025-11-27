@@ -380,27 +380,18 @@ class VecDB:
                     threshold = -heap[0][0]
 
     def _rerank_candidates(self, candidate_ids, query, top_k):
-        if not candidate_ids:
-            return []
+        final_heap = []
         
-        batch_vectors = []
-        batch_size = 1000
-        
-        for i in range(0, len(candidate_ids), batch_size):
-            batch_ids = candidate_ids[i:i + batch_size]
-            batch_vecs = [self.get_one_row(idx) for idx in batch_ids]
-            batch_vectors.extend(batch_vecs)
-        
-        batch_vectors = np.array(batch_vectors, dtype=np.float32)
-        similarities = np.dot(batch_vectors, query)
-        
-        if len(similarities) <= top_k:
-            top_indices = np.argsort(similarities)[::-1]
-        else:
-            top_indices = np.argpartition(similarities, -top_k)[-top_k:]
-            top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
-        
-        return [candidate_ids[i] for i in top_indices]
+        for idx in candidate_ids:
+            vec = self.get_one_row(idx)
+            sim = self._call_score(vec, query)
+            if len(final_heap) < top_k:
+                heapq.heappush(final_heap, (float(sim), idx))
+            elif sim > final_heap[0][0]:
+                heapq.heapreplace(final_heap, (float(sim), idx))
+
+        final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
+        return final_results
     
     def _get_unique_candidates(self, candidate_heap):
         seen = set()
