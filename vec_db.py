@@ -336,16 +336,16 @@ class VecDB:
     
     def _compute_pq_distances(self, query_residual, codebooks, local_codes):
         n_vecs = len(local_codes)
-        dist = np.zeros(n_vecs, dtype=np.float32)
+        
         query_norms = np.zeros(self.n_subvectors, dtype=np.float32)
-
         for i in range(self.n_subvectors):
             start_idx = i * self.subvector_dim
             end_idx = (i + 1) * self.subvector_dim
             qr = query_residual[start_idx:end_idx]
             query_norms[i] = np.dot(qr, qr)
         
-        batch_size = min(5000, n_vecs)
+        batch_size = min(10000, n_vecs)
+        dist = np.zeros(n_vecs, dtype=np.float32)
         
         for batch_start in range(0, n_vecs, batch_size):
             batch_end = min(batch_start + batch_size, n_vecs)
@@ -356,9 +356,9 @@ class VecDB:
                 cb = codebooks[i]
                 code_indices = batch_codes[:, i]
                 cb_vectors = cb[code_indices]
-                cb_norms = np.sum(cb_vectors * cb_vectors, axis=1)
+                cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
                 qr = query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim]
-                dots = np.sum(cb_vectors * qr, axis=1)
+                dots = np.dot(cb_vectors, qr)
                 batch_dist += query_norms[i] + cb_norms - 2 * dots
             
             dist[batch_start:batch_end] = batch_dist
@@ -382,7 +382,7 @@ class VecDB:
                     threshold = -heap[0][0]
 
     def _rerank_candidates(self, candidate_ids, query, top_k):
-        vecs = np.array([self.get_one_row(idx) for idx in candidate_ids])
+        vecs = np.array([self.get_one_row(idx) for idx in candidate_ids]) # --> problem line
         sims = vecs @ query
 
         if len(sims) <= top_k:
