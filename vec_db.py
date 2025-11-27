@@ -352,11 +352,12 @@ class VecDB:
             batch_dist = np.zeros(batch_end - batch_start, dtype=np.float32)
             
             for i in range(self.n_subvectors):
-                cb = codebooks[i]
+                cb = codebooks[i]  # already float32
                 code_indices = batch_codes[:, i]
-                cb_vectors = cb[code_indices].astype(np.float32)
-                cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
-                dots = np.dot(cb_vectors, query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim])
+                cb_vectors = cb[code_indices]  # no astype()
+                cb_norms = np.sum(cb_vectors * cb_vectors, axis=1)
+                qr = query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim]
+                dots = np.sum(cb_vectors * qr, axis=1)
                 batch_dist += query_norms[i] + cb_norms - 2 * dots
             
             dist[batch_start:batch_end] = batch_dist
@@ -380,28 +381,21 @@ class VecDB:
                     threshold = -heap[0][0]
 
     def _rerank_candidates(self, candidate_ids, query, top_k):
-        final_heap = []
+        # stack all candidate vectors at once
+        vecs = np.stack([self.get_one_row(idx) for idx in candidate_ids], axis=0)
+        sims = vecs @ query  # dot product
         
-        for idx in candidate_ids:
-            vec = self.get_one_row(idx)
-            sim = self._call_score(vec, query)
-            if len(final_heap) < top_k:
-                heapq.heappush(final_heap, (float(sim), idx))
-            elif sim > final_heap[0][0]:
-                heapq.heapreplace(final_heap, (float(sim), idx))
+        # get top_k indices
+        top_idx = np.argpartition(-sims, top_k-1)[:top_k]
+        # sort top_k by similarity
+        sorted_top_idx = top_idx[np.argsort(-sims[top_idx])]
+        
+        results = [candidate_ids[i] for i in sorted_top_idx]
+        return results
 
-        final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
-        return final_results
-    
     def _get_unique_candidates(self, candidate_heap):
-        seen = set()
-        unique_candidates = []
-
-        for _, idx in candidate_heap:
-            if idx not in seen:
-                seen.add(idx)
-                unique_candidates.append(idx)
-
+        candidate_ids = np.array([idx for _, idx in candidate_heap], dtype=np.int32)
+        unique_candidates = np.unique(candidate_ids)
         return unique_candidates
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
