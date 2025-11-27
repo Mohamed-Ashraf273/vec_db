@@ -5,6 +5,7 @@ import gc
 import math
 import heapq
 from sklearn.cluster import MiniBatchKMeans
+import time
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -334,28 +335,35 @@ class VecDB:
         return None
     
     def _compute_pq_distances(self, query_residual, codebooks, local_codes):
-        
-        query_subvectors = query_residual.reshape(self.n_subvectors, self.subvector_dim)  # n_subvectors x subvector_dim
-        
-        # gather codebook vectors for all local codes
-        # shape: n_vecs x n_subvectors x subvector_dim
-        cb_vectors = np.stack([codebooks[i][local_codes[:, i]] for i in range(self.n_subvectors)], axis=1)
-        
-        # compute squared norms
-        cb_norms = np.sum(cb_vectors ** 2, axis=2)                 # n_vecs x n_subvectors
-        query_norms = np.sum(query_subvectors ** 2, axis=1)        # n_subvectors
-        
-        # compute dot products with broadcasting
-        # cb_vectors: n_vecs x n_subvectors x subvector_dim
-        # query_subvectors: 1 x n_subvectors x subvector_dim
-        dots = np.sum(cb_vectors * query_subvectors[None, :, :], axis=2)  # n_vecs x n_subvectors
-        
-        # squared distances
-        dist = np.sum(cb_norms + query_norms[None, :] - 2*dots, axis=1)  # n_vecs
-        
-        return dist.astype(np.float16)
+        n_vecs = len(local_codes)
+        dist = np.zeros(n_vecs, dtype=np.float32)
+        query_norms = np.zeros(self.n_subvectors, dtype=np.float32)
 
-
+        for i in range(self.n_subvectors):
+            start_idx = i * self.subvector_dim
+            end_idx = (i + 1) * self.subvector_dim
+            qr = query_residual[start_idx:end_idx]
+            query_norms[i] = np.dot(qr, qr)
+        
+        batch_size = min(5000, n_vecs)
+        
+        for batch_start in range(0, n_vecs, batch_size):
+            batch_end = min(batch_start + batch_size, n_vecs)
+            batch_codes = local_codes[batch_start:batch_end]
+            batch_dist = np.zeros(batch_end - batch_start, dtype=np.float32)
+            
+            for i in range(self.n_subvectors):
+                cb = codebooks[i]
+                code_indices = batch_codes[:, i]
+                cb_vectors = cb[code_indices]
+                cb_norms = np.sum(cb_vectors * cb_vectors, axis=1)
+                qr = query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim]
+                dots = np.sum(cb_vectors * qr, axis=1)
+                batch_dist += query_norms[i] + cb_norms - 2 * dots
+            
+            dist[batch_start:batch_end] = batch_dist
+        
+        return dist
     
     def _update_candidate_heap(self, heap, distances, indices, n_vecs, n_take):
         if len(heap) < n_take:
@@ -373,17 +381,25 @@ class VecDB:
                     heapq.heapreplace(heap, (-d, int(indices[idx_pos])))
                     threshold = -heap[0][0]
 
-    def _rerank_candidates(self, candidate_ids, query, top_k):
-        # stack all candidate vectors at once
-        vecs = np.stack([self.get_one_row(idx) for idx in candidate_ids], axis=0)
-        sims = vecs @ query  # dot product
-        
-        # get top_k indices
-        top_idx = np.argpartition(-sims, top_k-1)[:top_k]
-        # sort top_k by similarity
-        sorted_top_idx = top_idx[np.argsort(-sims[top_idx])]
-        
-        results = [candidate_ids[i] for i in sorted_top_idx]
+    def _rerank_candidates(self, candidate_ids, query, top_k, batch_size=1024):
+        t1 = time.time()
+        final_heap = []
+
+        for i in range(0, len(candidate_ids), batch_size):
+            batch_ids = candidate_ids[i:i+batch_size]
+            batch_vecs = np.array([self.get_one_row(idx) for idx in batch_ids], dtype=np.float32)
+            sims = batch_vecs @ query
+
+            for j, sim in enumerate(sims):
+                idx = batch_ids[j]
+                if len(final_heap) < top_k:
+                    heapq.heappush(final_heap, (float(sim), idx))
+                elif sim > final_heap[0][0]:
+                    heapq.heapreplace(final_heap, (float(sim), idx))
+
+        results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
+        t2 = time.time()
+        print(f"Reranking {len(candidate_ids)} candidates took {t2 - t1:.4f} seconds")
         return results
 
     def _get_unique_candidates(self, candidate_heap):
@@ -402,12 +418,12 @@ class VecDB:
 
         n = self._get_num_records()
 
-        if n > 15*10**6: # 20M+
+        if n > 15*10**6:  # 20M+
             factor = 482
-        elif n > 10*10**6: # 15M+
+        elif n > 10*10**6:  # 15M+
             factor = 450
-        elif n > 1*10**6: # 1M+
-            factor = 475 
+        elif n > 1*10**6:  # 1M+
+            factor = 475
         else:
             factor = 102
 
