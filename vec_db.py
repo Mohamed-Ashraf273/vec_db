@@ -416,7 +416,7 @@ class VecDB:
         n = self._get_num_records()
 
         if n > 15*10**6: # 20M+
-            factor = 500
+            factor = 482
         elif n > 10*10**6: # 15M+
             factor = 450
         elif n > 1*10**6: # 1M+
