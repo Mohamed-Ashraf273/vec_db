@@ -413,8 +413,18 @@ class VecDB:
         if n_probes is None:
             n_probes = 44
 
-        n_take = top_k * 500
+        n = self._get_num_records()
 
+        if n > 15*10**6: # 20M+
+            factor = 500
+        elif n > 10*10**6: # 15M+
+            factor = 450
+        elif n > 1*10**6: # 1M+
+            factor = 475 
+        else:
+            factor = 102
+
+        n_take = top_k * factor
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
         codebooks = self._get_pq_codebooks()
 
