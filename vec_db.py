@@ -74,13 +74,12 @@ class VecDB:
         return np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
     
     def _find_nearest_clusters(self, query, n_clusters, n_probes):
-        similarities = []
-        for i in range(n_clusters):
-            centroid = self._get_centroid(i)
-            sim = self._call_score(centroid, query)
-            similarities.append(sim)
+        # Precompute all centroids at once
+        centroids = np.array([self._get_centroid(i) for i in range(n_clusters)])
         
-        similarities = np.array(similarities)
+        # Vectorized similarity computation
+        similarities = np.dot(centroids, query)
+        
         n_probes = min(n_probes, n_clusters)
         
         if n_probes >= n_clusters:
@@ -116,7 +115,7 @@ class VecDB:
         best_inertia = float('inf')
         best_kmeans = None
         
-        n_runs = 5
+        n_runs = 3
         
         for run in range(n_runs):
             kmeans = MiniBatchKMeans(
@@ -172,7 +171,7 @@ class VecDB:
             best_inertia = float('inf')
             best_centers = None
             
-            n_runs = 5
+            n_runs = 2
             
             for run in range(n_runs):
                 kmeans = MiniBatchKMeans(
