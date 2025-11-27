@@ -79,7 +79,6 @@ class VecDB:
             centroid = self._get_centroid(i)
             sim = self._call_score(centroid, query)
             similarities.append(sim)
-            del centroid
         
         similarities = np.array(similarities)
         n_probes = min(n_probes, n_clusters)
@@ -343,8 +342,8 @@ class VecDB:
     def _compute_pq_distances(self, query_residual, codebooks, local_codes):
         n_vecs = len(local_codes)
         dist = np.zeros(n_vecs, dtype=np.float32)
-        
         query_norms = np.zeros(self.n_subvectors, dtype=np.float32)
+
         for i in range(self.n_subvectors):
             start_idx = i * self.subvector_dim
             end_idx = (i + 1) * self.subvector_dim
@@ -362,10 +361,8 @@ class VecDB:
                 cb = codebooks[i]
                 code_indices = batch_codes[:, i]
                 cb_vectors = cb[code_indices].astype(np.float32)
-                
                 cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
                 dots = np.dot(cb_vectors, query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim])
-                
                 batch_dist += query_norms[i] + cb_norms - 2 * dots
             
             dist[batch_start:batch_end] = batch_dist
@@ -405,6 +402,7 @@ class VecDB:
     def _get_unique_candidates(self, candidate_heap):
         seen = set()
         unique_candidates = []
+
         for _, idx in candidate_heap:
             if idx not in seen:
                 seen.add(idx)
@@ -421,10 +419,11 @@ class VecDB:
         if n_probes is None:
             n_probes = 44
 
+        n_take = top_k * 500
+
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
         codebooks = self._get_pq_codebooks()
 
-        n_take = top_k * 485
         candidate_heap = []
         for cid in cluster_ids:
             indices = self._get_cluster_indices(cid)
@@ -449,12 +448,7 @@ class VecDB:
             return []
         
         candidate_ids = self._get_unique_candidates(candidate_heap)
-        del candidate_heap, dist, codebooks, centroid, query_residual, indices, local_codes
-        gc.collect()
-        
         results = self._rerank_candidates(candidate_ids, query, top_k)
-        del candidate_ids
-        gc.collect()
         return results
 
     def _call_score(self, vec1, vec2):
