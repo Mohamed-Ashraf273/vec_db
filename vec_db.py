@@ -74,14 +74,9 @@ class VecDB:
         return np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
     
     def _find_nearest_clusters(self, query, n_clusters, n_probes):
-        # Precompute all centroids at once
         centroids = np.array([self._get_centroid(i) for i in range(n_clusters)])
-        
-        # Vectorized similarity computation
         similarities = np.dot(centroids, query)
-        
         n_probes = min(n_probes, n_clusters)
-        
         if n_probes >= n_clusters:
             top_clusters = np.arange(n_clusters)
         else:
@@ -385,18 +380,27 @@ class VecDB:
                     threshold = -heap[0][0]
 
     def _rerank_candidates(self, candidate_ids, query, top_k):
-        final_heap = []
+        if not candidate_ids:
+            return []
         
-        for idx in candidate_ids:
-            vec = self.get_one_row(idx)
-            sim = self._call_score(vec, query)
-            if len(final_heap) < top_k:
-                heapq.heappush(final_heap, (float(sim), idx))
-            elif sim > final_heap[0][0]:
-                heapq.heapreplace(final_heap, (float(sim), idx))
-
-        final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
-        return final_results
+        batch_vectors = []
+        batch_size = 1000
+        
+        for i in range(0, len(candidate_ids), batch_size):
+            batch_ids = candidate_ids[i:i + batch_size]
+            batch_vecs = [self.get_one_row(idx) for idx in batch_ids]
+            batch_vectors.extend(batch_vecs)
+        
+        batch_vectors = np.array(batch_vectors, dtype=np.float32)
+        similarities = np.dot(batch_vectors, query)
+        
+        if len(similarities) <= top_k:
+            top_indices = np.argsort(similarities)[::-1]
+        else:
+            top_indices = np.argpartition(similarities, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
+        
+        return [candidate_ids[i] for i in top_indices]
     
     def _get_unique_candidates(self, candidate_heap):
         seen = set()
