@@ -381,46 +381,17 @@ class VecDB:
                     heapq.heapreplace(heap, (-d, int(indices[idx_pos])))
                     threshold = -heap[0][0]
 
-    def _rerank_candidates(self, candidate_ids, query, top_k, batch_size=2048):
-        t1 = time.time()
-        
-        # SINGLE memory map for entire database - DO THIS ONCE
-        num_records = self._get_num_records()
-        full_mmap = np.memmap(self.db_path, dtype=np.float32, mode='r', 
-                            shape=(num_records, DIMENSION))
-        
-        # Process ALL candidates at once if possible
-        if len(candidate_ids) <= 10000:
-            # GET ALL VECTORS IN ONE SHOT
-            batch_vecs = full_mmap[candidate_ids]
-            sims = batch_vecs @ query
-            
-            # GET TOP-K DIRECTLY - NO HEAP
-            if len(candidate_ids) <= top_k:
-                results = candidate_ids[np.argsort(sims)[::-1]].tolist()
-            else:
-                top_indices = np.argpartition(sims, -top_k)[-top_k:]
-                top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
-                results = candidate_ids[top_indices].tolist()
-        else:
-            # For large candidate sets, use batches but with SINGLE memory map
-            final_heap = []
-            for i in range(0, len(candidate_ids), batch_size):
-                batch_ids = candidate_ids[i:i+batch_size]
-                batch_vecs = full_mmap[batch_ids]  # FAST DIRECT ACCESS
-                sims = batch_vecs @ query
+    def _rerank_candidates(self, candidate_ids, query, top_k):
+        vecs = np.array([self.get_one_row(idx) for idx in candidate_ids])
+        sims = vecs @ query
 
-                for j, sim in enumerate(sims):
-                    idx = batch_ids[j]
-                    if len(final_heap) < top_k:
-                        heapq.heappush(final_heap, (float(sim), idx))
-                    elif sim > final_heap[0][0]:
-                        heapq.heapreplace(final_heap, (float(sim), idx))
+        if len(sims) <= top_k:
+            top_indices = np.argsort(sims)[::-1]
+        else:
+            top_indices = np.argpartition(sims, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
             
-            results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
-        
-        t2 = time.time()
-        print(f"Reranking {len(candidate_ids)} candidates took {t2 - t1:.4f} seconds")
+        results = candidate_ids[top_indices]
         return results
 
     def _get_unique_candidates(self, candidate_heap):
