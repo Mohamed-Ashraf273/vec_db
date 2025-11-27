@@ -5,6 +5,7 @@ import gc
 import math
 import heapq
 from sklearn.cluster import MiniBatchKMeans
+import time
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -74,15 +75,9 @@ class VecDB:
         return np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
     
     def _find_nearest_clusters(self, query, n_clusters, n_probes):
-        similarities = []
-        for i in range(n_clusters):
-            centroid = self._get_centroid(i)
-            sim = self._call_score(centroid, query)
-            similarities.append(sim)
-        
-        similarities = np.array(similarities)
+        centroids = np.array([self._get_centroid(i) for i in range(n_clusters)])
+        similarities = np.dot(centroids, query)
         n_probes = min(n_probes, n_clusters)
-        
         if n_probes >= n_clusters:
             top_clusters = np.arange(n_clusters)
         else:
@@ -116,7 +111,7 @@ class VecDB:
         best_inertia = float('inf')
         best_kmeans = None
         
-        n_runs = 5
+        n_runs = 3
         
         for run in range(n_runs):
             kmeans = MiniBatchKMeans(
@@ -172,7 +167,7 @@ class VecDB:
             best_inertia = float('inf')
             best_centers = None
             
-            n_runs = 5
+            n_runs = 2
             
             for run in range(n_runs):
                 kmeans = MiniBatchKMeans(
@@ -360,9 +355,10 @@ class VecDB:
             for i in range(self.n_subvectors):
                 cb = codebooks[i]
                 code_indices = batch_codes[:, i]
-                cb_vectors = cb[code_indices].astype(np.float32)
-                cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
-                dots = np.dot(cb_vectors, query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim])
+                cb_vectors = cb[code_indices]
+                cb_norms = np.sum(cb_vectors * cb_vectors, axis=1)
+                qr = query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim]
+                dots = np.sum(cb_vectors * qr, axis=1)
                 batch_dist += query_norms[i] + cb_norms - 2 * dots
             
             dist[batch_start:batch_end] = batch_dist
@@ -386,28 +382,21 @@ class VecDB:
                     threshold = -heap[0][0]
 
     def _rerank_candidates(self, candidate_ids, query, top_k):
-        final_heap = []
-        
-        for idx in candidate_ids:
-            vec = self.get_one_row(idx)
-            sim = self._call_score(vec, query)
-            if len(final_heap) < top_k:
-                heapq.heappush(final_heap, (float(sim), idx))
-            elif sim > final_heap[0][0]:
-                heapq.heapreplace(final_heap, (float(sim), idx))
+        vecs = np.array([self.get_one_row(idx) for idx in candidate_ids])
+        sims = vecs @ query
 
-        final_results = [idx for _, idx in heapq.nlargest(top_k, final_heap)]
-        return final_results
-    
+        if len(sims) <= top_k:
+            top_indices = np.argsort(sims)[::-1]
+        else:
+            top_indices = np.argpartition(sims, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+            
+        results = candidate_ids[top_indices]
+        return results
+
     def _get_unique_candidates(self, candidate_heap):
-        seen = set()
-        unique_candidates = []
-
-        for _, idx in candidate_heap:
-            if idx not in seen:
-                seen.add(idx)
-                unique_candidates.append(idx)
-
+        candidate_ids = np.array([idx for _, idx in candidate_heap], dtype=np.int32)
+        unique_candidates = np.unique(candidate_ids)
         return unique_candidates
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
@@ -419,8 +408,18 @@ class VecDB:
         if n_probes is None:
             n_probes = 44
 
-        n_take = top_k * 500
+        n = self._get_num_records()
 
+        if n > 15*10**6:  # 20M+
+            factor = 482
+        elif n > 10*10**6:  # 15M+
+            factor = 450
+        elif n > 1*10**6:  # 1M+
+            factor = 475
+        else:
+            factor = 105
+
+        n_take = top_k * factor
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
         codebooks = self._get_pq_codebooks()
 
