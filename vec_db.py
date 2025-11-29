@@ -440,7 +440,7 @@ class VecDB:
         elif n <= 10_000_000:
             factor = 125
         else:
-            factor = 298
+            factor = 324
 
         n_take = top_k * factor
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
