@@ -5,7 +5,8 @@ import gc
 import math
 import heapq
 from sklearn.cluster import MiniBatchKMeans
-import time
+from sklearn.metrics.pairwise import pairwise_distances, pairwise_distances_argmin
+
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -119,9 +120,8 @@ class VecDB:
                 batch_size=min_batch_size,
                 random_state=DB_SEED_NUMBER + run,
                 max_iter=300,
-                n_init=1,
+                n_init=10,
                 init='k-means++',
-                reassignment_ratio=0.01,
                 max_no_improvement=20
             )
             
@@ -154,20 +154,21 @@ class VecDB:
     def _build_pq_codebooks(self, vectors, centroids, inverted_index):
         pq_codebooks = []
         num_records = self._get_num_records()
-        
         index_to_centroid = np.zeros((num_records, self.dim), dtype=np.float16)
+        cluster_weights = {}
+        n_runs = 4 if num_records < 20_000_000 else 2
+        
         for cluster_id, indices in inverted_index.items():
+            cluster_size = len(indices)
             for idx in indices:
                 index_to_centroid[idx] = centroids[cluster_id]
+            cluster_weights[cluster_id] = cluster_size / num_records
         
         for subspace in range(self.n_subvectors):
             start_idx = subspace * self.subvector_dim
             end_idx = (subspace + 1) * self.subvector_dim
-            
             best_inertia = float('inf')
             best_centers = None
-            
-            n_runs = 2
             
             for run in range(n_runs):
                 kmeans = MiniBatchKMeans(
@@ -177,16 +178,19 @@ class VecDB:
                     max_iter=100,
                     n_init=1,
                     init='k-means++',
-                    reassignment_ratio=0.01,
                     max_no_improvement=15
                 )
                 
-                batch_size = 50000
-                for batch_start in range(0, num_records, batch_size):
-                    batch_end = min(batch_start + batch_size, num_records)
-                    batch_vectors = vectors[batch_start:batch_end]
-                    batch_centroids = index_to_centroid[batch_start:batch_end]
-                    
+                for _ in range(3):
+                    rng = np.random.default_rng(DB_SEED_NUMBER + subspace * 100 + run * 10 + _)
+                    indices = rng.choice(
+                        num_records, 
+                        size=100000, 
+                        replace=num_records < 100000,
+                        p=self._get_cluster_sampling_weights(inverted_index, cluster_weights)
+                    )
+                    batch_vectors = vectors[indices]
+                    batch_centroids = index_to_centroid[indices]
                     residuals = batch_vectors - batch_centroids
                     subspace_residuals = residuals[:, start_idx:end_idx]
                     kmeans.partial_fit(subspace_residuals)
@@ -195,6 +199,8 @@ class VecDB:
                     best_inertia = kmeans.inertia_
                     best_centers = kmeans.cluster_centers_
             
+            if num_records < 20_000_000:
+                best_centers = self._refine_codebook(best_centers, subspace_residuals)
             pq_codebooks.append(best_centers)
         
         for i in range(len(pq_codebooks)):
@@ -202,6 +208,21 @@ class VecDB:
         
         del index_to_centroid
         return pq_codebooks
+
+    def _get_cluster_sampling_weights(self, inverted_index, cluster_weights):
+        weights = np.zeros(self._get_num_records())
+        for cluster_id, indices in inverted_index.items():
+            weights[indices] = cluster_weights[cluster_id]
+        return weights / np.sum(weights)
+
+    def _refine_codebook(self, centers, residuals, n_refinement_steps=5):
+        for _ in range(n_refinement_steps):
+            labels = pairwise_distances_argmin(residuals, centers)
+            new_centers = np.array([residuals[labels == i].mean(axis=0) 
+                                for i in range(len(centers))])
+            mask = ~np.isnan(new_centers).any(axis=1)
+            centers[mask] = new_centers[mask]
+        return centers
 
     def _compute_compressed_codes(self, vectors, pq_codebooks, inverted_index, centroids):
         num_records = self._get_num_records()
@@ -404,20 +425,22 @@ class VecDB:
         query /= np.linalg.norm(query) + 1e-10
 
         n_clusters = self._get_n_clusters()
-
-        if n_probes is None:
-            n_probes = 44
-
         n = self._get_num_records()
 
-        if n > 15*10**6:  # 20M+
-            factor = 482
-        elif n > 10*10**6:  # 15M+
-            factor = 450
-        elif n > 1*10**6:  # 1M+
-            factor = 475
+        if n <= 1_000_000:
+            n_probes = 26
+        elif n <= 10_000_000:
+            n_probes = 42
+        else: #20
+            n_probes = 39
+
+
+        if n <= 1_000_000:
+            factor = 100
+        elif n <= 10_000_000:
+            factor = 125
         else:
-            factor = 105
+            factor = 298
 
         n_take = top_k * factor
         cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
