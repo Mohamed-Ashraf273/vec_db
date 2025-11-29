@@ -427,12 +427,12 @@ class VecDB:
         n_clusters = self._get_n_clusters()
         n = self._get_num_records()
 
-        if n <= 1_000_000: # 1M done
+        if n <= 1_000_000:
             n_probes = 6
-        elif n <= 10_000_000:# 10M
+        elif n <= 10_000_000:
             n_probes = 2
-        else: #20
-            n_probes = 4 # 20M
+        else:
+            n_probes = 4
 
 
         if n <= 1_000_000:
