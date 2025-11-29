@@ -1,12 +1,16 @@
 from typing import Dict, List, Annotated
 import numpy as np
 import os
+import gc
 import math
+import heapq
 from sklearn.cluster import MiniBatchKMeans
+from sklearn.metrics.pairwise import pairwise_distances, pairwise_distances_argmin
+
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
-DIMENSION = 70
+DIMENSION = 64
 
 class VecDB:
     def __init__(self, database_file_path="saved_db.dat", index_file_path="index.dat", new_db=True, db_size=None) -> None:
@@ -14,26 +18,31 @@ class VecDB:
         self.index_path = index_file_path
         self.dim = DIMENSION
         
-        # Index configuration - these are fixed-size values, allowed in init
+        # Index configuration - RESIDUAL quantization for better compression
         self.db_size = db_size if db_size is not None else 0
-        self.n_subvectors = 7
-        self.n_patterns = 256
+        self.n_subvectors = 8
         self.subvector_dim = self.dim // self.n_subvectors
+        self.n_patterns = 240
         
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
+            
             # delete the old DB file if exists
-            if os.path.exists(self.db_path):
-                os.remove(self.db_path)
+            # if os.path.exists(self.db_path):
+            #     os.remove(self.db_path)
 
-            self.n_patterns = min(self.n_patterns, db_size)
+            if os.path.exists(self.index_path):
+                import shutil
+                shutil.rmtree(self.index_path)
+
             self.generate_database(db_size)
     
     def generate_database(self, size: int) -> None:
-        rng = np.random.default_rng(DB_SEED_NUMBER)
-        vectors = rng.random((size, DIMENSION), dtype=np.float32)
-        self._write_vectors_to_file(vectors)
+        # rng = np.random.default_rng(DB_SEED_NUMBER)
+        # vectors = rng.random((size, DIMENSION), dtype=np.float32)
+        # vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10
+        # self._write_vectors_to_file(vectors)
         self._build_index()
 
     def _write_vectors_to_file(self, vectors: np.ndarray) -> None:
@@ -44,7 +53,7 @@ class VecDB:
     def _get_num_records(self) -> int:
         return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
 
-    def insert_records(self, rows: Annotated[np.ndarray, (int, 70)]):
+    def insert_records(self, rows: Annotated[np.ndarray, (int, 64)]):
         num_old_records = self._get_num_records()
         num_new_records = len(rows)
         full_shape = (num_old_records + num_new_records, DIMENSION)
@@ -56,17 +65,28 @@ class VecDB:
 
     def get_one_row(self, row_num: int) -> np.ndarray:
         try:
-            offset = row_num * DIMENSION * ELEMENT_SIZE
+            offset = np.int64(row_num) * np.int64(DIMENSION) * np.int64(ELEMENT_SIZE)
             mmap_vector = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(1, DIMENSION), offset=offset)
             return np.array(mmap_vector[0])
         except Exception as e:
             return f"An error occurred: {e}"
 
-    def get_all_rows(self) -> np.ndarray:
+    def get_all_rows(self) -> np.memmap:
         num_records = self._get_num_records()
-        vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
-        return np.array(vectors)
+        return np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
     
+    def _find_nearest_clusters(self, query, n_clusters, n_probes):
+        centroids = np.array([self._get_centroid(i) for i in range(n_clusters)])
+        similarities = np.dot(centroids, query)
+        n_probes = min(n_probes, n_clusters)
+        if n_probes >= n_clusters:
+            top_clusters = np.arange(n_clusters)
+        else:
+            top_clusters = np.argpartition(similarities, -n_probes)[-n_probes:]
+            top_clusters = top_clusters[np.argsort(similarities[top_clusters])[::-1]]
+        
+        return top_clusters.tolist()
+
     def _determine_n_clusters(self, n_vectors):
         # Resources:
         # https://github.com/facebookresearch/faiss/wiki/Faiss-indexes
@@ -81,89 +101,377 @@ class VecDB:
         else:
             base = math.sqrt(n_vectors)
             n_clusters = int(base)  
-            n_clusters = max(256, min(n_clusters, 4096))
+            n_clusters = max(256, min(n_clusters, 1024))
             n_clusters = 2 ** math.ceil(math.log2(n_clusters))
             return min(n_clusters, n_vectors)
     
-    def _ivf_execute(self, vectors, min_batch_size=10000, max_batch_size=50000):
-        n_vectors = vectors.shape[0]
-        self.n_clusters = self._determine_n_clusters(n_vectors)
-        raw_batch_size = 50 * self.n_clusters
-        batch_size = max(min_batch_size, min(raw_batch_size, max_batch_size))
+    def _ivf_execute(self, vectors, min_batch_size=10000):
+        num_records = self._get_num_records()
+        n_clusters = self._determine_n_clusters(num_records)
         
-        kmeans = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=batch_size, 
-                                random_state=42, max_iter=100, n_init=3)
-        labels = kmeans.fit_predict(vectors)
-        self.centroids = kmeans.cluster_centers_
+        best_inertia = float('inf')
+        best_kmeans = None
+        
+        n_runs = 3
+        
+        for run in range(n_runs):
+            kmeans = MiniBatchKMeans(
+                n_clusters=n_clusters,
+                batch_size=min_batch_size,
+                random_state=DB_SEED_NUMBER + run,
+                max_iter=300,
+                n_init=10,
+                init='k-means++',
+                max_no_improvement=20
+            )
+            
+            batch_size = 50000
+            for batch_start in range(0, num_records, batch_size):
+                batch_end = min(batch_start + batch_size, num_records)
+                batch_vectors = vectors[batch_start:batch_end]
+                kmeans.partial_fit(batch_vectors)
+            
+            if kmeans.inertia_ < best_inertia:
+                best_inertia = kmeans.inertia_
+                best_kmeans = kmeans
+        
+        centroids = best_kmeans.cluster_centers_
+        centroids /= np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-10
+        centroids = centroids.astype(np.float16)
+        
+        inverted_index = {i: [] for i in range(n_clusters)}
+        
+        for batch_start in range(0, num_records, batch_size):
+            batch_end = min(batch_start + batch_size, num_records)
+            batch_vectors = vectors[batch_start:batch_end]
+            batch_labels = best_kmeans.predict(batch_vectors)
+            
+            for i, label in enumerate(batch_labels):
+                inverted_index[label].append(batch_start + i)
+        
+        return inverted_index, centroids
 
-        index_structure = []
-        for cluster_id in range(self.n_clusters):
-            cluster_indices = np.where(labels == cluster_id)[0]
-            index_structure.extend([len(cluster_indices)] + list(cluster_indices))
+    def _build_pq_codebooks(self, vectors, centroids, inverted_index):
+        pq_codebooks = []
+        num_records = self._get_num_records()
+        index_to_centroid = np.zeros((num_records, self.dim), dtype=np.float16)
+        cluster_weights = {}
+        n_runs = 4 if num_records < 20_000_000 else 2
         
-        index_array = np.array(index_structure, dtype=np.int32)
-        index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='w+', 
-                            shape=index_array.shape)
-        index_mmap[:] = index_array[:]
-        index_mmap.flush()
+        for cluster_id, indices in inverted_index.items():
+            cluster_size = len(indices)
+            for idx in indices:
+                index_to_centroid[idx] = centroids[cluster_id]
+            cluster_weights[cluster_id] = cluster_size / num_records
+        
+        for subspace in range(self.n_subvectors):
+            start_idx = subspace * self.subvector_dim
+            end_idx = (subspace + 1) * self.subvector_dim
+            best_inertia = float('inf')
+            best_centers = None
+            
+            for run in range(n_runs):
+                kmeans = MiniBatchKMeans(
+                    n_clusters=self.n_patterns,
+                    batch_size=10000,
+                    random_state=DB_SEED_NUMBER + subspace + run * 1000,
+                    max_iter=100,
+                    n_init=1,
+                    init='k-means++',
+                    max_no_improvement=15
+                )
+                
+                for _ in range(3):
+                    rng = np.random.default_rng(DB_SEED_NUMBER + subspace * 100 + run * 10 + _)
+                    indices = rng.choice(
+                        num_records, 
+                        size=100000, 
+                        replace=num_records < 100000,
+                        p=self._get_cluster_sampling_weights(inverted_index, cluster_weights)
+                    )
+                    batch_vectors = vectors[indices]
+                    batch_centroids = index_to_centroid[indices]
+                    residuals = batch_vectors - batch_centroids
+                    subspace_residuals = residuals[:, start_idx:end_idx]
+                    kmeans.partial_fit(subspace_residuals)
+                
+                if kmeans.inertia_ < best_inertia:
+                    best_inertia = kmeans.inertia_
+                    best_centers = kmeans.cluster_centers_
+            
+            if num_records < 20_000_000:
+                best_centers = self._refine_codebook(best_centers, subspace_residuals)
+            pq_codebooks.append(best_centers)
+        
+        for i in range(len(pq_codebooks)):
+            pq_codebooks[i] /= (np.linalg.norm(pq_codebooks[i], axis=1, keepdims=True) + 1e-10)
+        
+        del index_to_centroid
+        return pq_codebooks
+
+    def _get_cluster_sampling_weights(self, inverted_index, cluster_weights):
+        weights = np.zeros(self._get_num_records())
+        for cluster_id, indices in inverted_index.items():
+            weights[indices] = cluster_weights[cluster_id]
+        return weights / np.sum(weights)
+
+    def _refine_codebook(self, centers, residuals, n_refinement_steps=5):
+        for _ in range(n_refinement_steps):
+            labels = pairwise_distances_argmin(residuals, centers)
+            new_centers = np.array([residuals[labels == i].mean(axis=0) 
+                                for i in range(len(centers))])
+            mask = ~np.isnan(new_centers).any(axis=1)
+            centers[mask] = new_centers[mask]
+        return centers
+
+    def _compute_compressed_codes(self, vectors, pq_codebooks, inverted_index, centroids):
+        num_records = self._get_num_records()
+        index_to_cluster = {}
+        for cluster_id, indices in inverted_index.items():
+            for idx in indices:
+                index_to_cluster[idx] = cluster_id
+
+        cluster_codes = {}
+        batch_size = 10000
+        for batch_start in range(0, num_records, batch_size):
+            batch_end = min(batch_start + batch_size, num_records)
+            batch_vectors = vectors[batch_start:batch_end]
+
+            batch_residuals = np.zeros_like(batch_vectors)
+            for i in range(len(batch_vectors)):
+                global_idx = batch_start + i
+                cluster_id = index_to_cluster.get(global_idx)
+                if cluster_id is not None:
+                    batch_residuals[i] = batch_vectors[i] - centroids[cluster_id]
+
+            batch_codes = np.zeros((len(batch_vectors), self.n_subvectors), dtype=np.uint8)
+            for subspace in range(self.n_subvectors):
+                start_dim = subspace * self.subvector_dim
+                end_dim = (subspace + 1) * self.subvector_dim
+                residual_chunk = batch_residuals[:, start_dim:end_dim]
+                codebook_subspace = pq_codebooks[subspace]
+
+                distances = self._call_score(residual_chunk, codebook_subspace.T)
+                batch_codes[:, subspace] = np.argmax(distances, axis=1)
+
+            for i in range(len(batch_vectors)):
+                global_idx = batch_start + i
+                cluster_id = index_to_cluster.get(global_idx)
+                if cluster_id is not None:
+                    if cluster_id not in cluster_codes:
+                        cluster_codes[cluster_id] = []
+                    cluster_codes[cluster_id].append(batch_codes[i])
+
+        for cluster_id, codes_list in cluster_codes.items():
+            if codes_list:
+                codes_array = np.array(codes_list, dtype=np.uint8)
+                codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
+
+                if codes_array.nbytes > 50000:
+                    with open(codes_path, 'wb') as f:
+                        np.savez_compressed(f, codes=codes_array)
+                else:
+                    codes_array.tofile(codes_path)
+        
+        del cluster_codes
+        gc.collect()
 
     def _build_index(self):
+        os.makedirs(self.index_path, exist_ok=True)
         vectors = self.get_all_rows()
-        self._ivf_execute(vectors)
+        inverted_index, centroids = self._ivf_execute(vectors)
+        pq_codebooks = self._build_pq_codebooks(vectors, centroids, inverted_index)
+        self._compute_compressed_codes(vectors, pq_codebooks, inverted_index, centroids)
+        
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        mmap_centroids = np.memmap(centroids_path, dtype=np.float16, mode='w+', shape=centroids.shape)
+        mmap_centroids[:] = centroids[:]
+        mmap_centroids.flush()
+        del mmap_centroids
 
-    def _find_nearest_clusters(self, query, centroids, n_probes):
-        similarities = []
-        for cluster_id, centroid in enumerate(centroids):
-            similarity = self._cal_score(query, centroid)
-            similarities.append((cluster_id, similarity))
-        
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return [cluster_id for cluster_id, _ in similarities[:n_probes]]
+        pq_codebooks_array = np.stack(pq_codebooks)
+        cb_path = os.path.join(self.index_path, "pq_cb.dat")
+        mmap_cb = np.memmap(cb_path, dtype=np.float16, mode='w+', shape=pq_codebooks_array.shape)
+        mmap_cb[:] = pq_codebooks_array[:]
+        mmap_cb.flush()
+        del mmap_cb
+
+        max_uint16 = np.iinfo(np.uint16).max
+        for cluster_id, indices in inverted_index.items():
+            indices = np.array(indices, dtype=np.uint32)
+            diffs = np.diff(indices, prepend=0)
+            
+            if diffs.max() <= max_uint16:
+                deltas = diffs.astype(np.uint16)
+            else:
+                deltas = diffs.astype(np.uint32)
+            
+            path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
+            deltas.tofile(path)
+
+        del vectors, centroids, pq_codebooks
+        gc.collect()
+
+    def _get_centroid(self, idx):
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        offset = idx * DIMENSION * np.dtype(np.float16).itemsize
+        mmap_centroid = np.memmap(centroids_path, dtype=np.float16, mode='r', 
+                                  shape=(DIMENSION,), offset=offset)
+        return np.array(mmap_centroid, dtype=np.float16)
+
+    def _get_n_clusters(self):
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        file_size = os.path.getsize(centroids_path)
+        return file_size // (DIMENSION * np.dtype(np.float16).itemsize)
     
-    def _load_cluster_indices(self, cluster_id):
-        index_mmap = np.memmap(self.index_path, dtype=np.int32, mode='r')
+    def _get_pq_codebooks(self):
+        cb_path = os.path.join(self.index_path, "pq_cb.dat")
+        if not os.path.exists(cb_path):
+            return None
         
-        pointer = 0
+        all_codebooks = np.memmap(cb_path, dtype=np.float16, mode='r', 
+                                shape=(self.n_subvectors, self.n_patterns, self.subvector_dim))
         
-        for _ in range(cluster_id):
-            cluster_size = index_mmap[pointer]
-            pointer += 1 + cluster_size
+        return np.array(all_codebooks, dtype=np.float16)
+
+    def _get_cluster_codes(self, cluster_id):
+        codes_path = os.path.join(self.index_path, f"index_codes_{cluster_id}.dat")
+        if os.path.exists(codes_path):
+            try:
+                with open(codes_path, 'rb') as f:
+                    data = np.load(f)['codes']
+                    return data
+            except:
+                return np.fromfile(codes_path, dtype=np.uint8).reshape(-1, self.n_subvectors)
+        return None
         
-        cluster_size = index_mmap[pointer]
-        pointer += 1
-        cluster_indices = index_mmap[pointer:pointer + cluster_size]
+    def _get_cluster_indices(self, cluster_id):
+        indices_path = os.path.join(self.index_path, f"deltas_{cluster_id}.dat")
+        if os.path.exists(indices_path):
+            deltas = np.fromfile(indices_path, dtype=np.uint16)
+            indices = deltas.cumsum().astype(np.int32)
+            num_records = self._get_num_records()
+            valid_mask = (indices >= 0) & (indices < num_records)
+            return indices[valid_mask]
+        return None
+    
+    def _compute_pq_distances(self, query_residual, codebooks, local_codes):
+        n_vecs = len(local_codes)
         
-        return np.array(cluster_indices) 
+        query_norms = np.zeros(self.n_subvectors, dtype=np.float32)
+        for i in range(self.n_subvectors):
+            start_idx = i * self.subvector_dim
+            end_idx = (i + 1) * self.subvector_dim
+            qr = query_residual[start_idx:end_idx]
+            query_norms[i] = np.dot(qr, qr)
+        
+        batch_size = min(10000, n_vecs)
+        dist = np.zeros(n_vecs, dtype=np.float32)
+        
+        for batch_start in range(0, n_vecs, batch_size):
+            batch_end = min(batch_start + batch_size, n_vecs)
+            batch_codes = local_codes[batch_start:batch_end]
+            batch_dist = np.zeros(batch_end - batch_start, dtype=np.float32)
+            
+            for i in range(self.n_subvectors):
+                cb = codebooks[i]
+                code_indices = batch_codes[:, i]
+                cb_vectors = cb[code_indices]
+                cb_norms = np.einsum('ij,ij->i', cb_vectors, cb_vectors)
+                qr = query_residual[i*self.subvector_dim:(i+1)*self.subvector_dim]
+                dots = np.dot(cb_vectors, qr)
+                batch_dist += query_norms[i] + cb_norms - 2 * dots
+            
+            dist[batch_start:batch_end] = batch_dist
+        
+        return dist
+    
+    def _update_candidate_heap(self, heap, distances, indices, n_vecs, n_take):
+        if len(heap) < n_take:
+            needed = n_take - len(heap)
+            take_n = min(needed, n_vecs)
+            top_idxs = np.argpartition(distances, take_n - 1)[:take_n]
+            for j in top_idxs:
+                heapq.heappush(heap, (-float(distances[j]), int(indices[j])))
+        else:
+            threshold = -heap[0][0]
+            mask = distances < threshold
+            for idx_pos in np.where(mask)[0]:
+                d = float(distances[idx_pos])
+                if d < threshold:
+                    heapq.heapreplace(heap, (-d, int(indices[idx_pos])))
+                    threshold = -heap[0][0]
+
+    def _rerank_candidates(self, candidate_ids, query, top_k):
+        vecs = np.array([self.get_one_row(idx) for idx in candidate_ids]) # --> problem line
+        sims = vecs @ query
+
+        if len(sims) <= top_k:
+            top_indices = np.argsort(sims)[::-1]
+        else:
+            top_indices = np.argpartition(sims, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(sims[top_indices])[::-1]]
+            
+        results = candidate_ids[top_indices]
+        return results
+
+    def _get_unique_candidates(self, candidate_heap):
+        candidate_ids = np.array([idx for _, idx in candidate_heap], dtype=np.int32)
+        unique_candidates = np.unique(candidate_ids)
+        return unique_candidates
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5, n_probes=None):
-        query = np.array(query).flatten()
-        if len(query) != self.dim:
-            raise ValueError(f"Query dimension {len(query)} != database dimension {self.dim}")
+        query = np.array(query, dtype=np.float32).flatten()
+        query /= np.linalg.norm(query) + 1e-10
 
-        if n_probes is None:
-            n_probes = max(4, min(32, self.n_clusters // 16))
-        
-        cluster_ids = self._find_nearest_clusters(query, self.centroids, n_probes)
+        n_clusters = self._get_n_clusters()
+        n = self._get_num_records()
 
-        candidate_indices = []
-        for cluster_id in cluster_ids:
-            cluster_indices = self._load_cluster_indices(cluster_id)
-            candidate_indices.extend(cluster_indices)
-        
-        candidate_indices = list(set(candidate_indices))
-        
-        results = []
-        for idx in candidate_indices:
-            vector = self.get_one_row(idx)
-            score = self._cal_score(query, vector)
-            results.append((idx, score))
-        
-        results.sort(key=lambda x: x[1], reverse=True)
-        return [idx for idx, _ in results[:top_k]]
+        if n <= 1_000_000:
+            n_probes = 6
+        elif n <= 10_000_000:
+            n_probes = 2
+        else:
+            n_probes = 4
 
-    def _cal_score(self, vec1, vec2):
-        dot_product = np.dot(vec1, vec2)
-        norm_vec1 = np.linalg.norm(vec1)
-        norm_vec2 = np.linalg.norm(vec2)
-        cosine_similarity = dot_product / (norm_vec1 * norm_vec2)
-        return cosine_similarity
+
+        if n <= 1_000_000:
+            factor = 14
+        elif n <= 10_000_000:
+            factor = 560
+        else:
+            factor = 90
+
+        n_take = top_k * factor
+        cluster_ids = self._find_nearest_clusters(query, n_clusters, n_probes)
+        codebooks = self._get_pq_codebooks()
+
+        candidate_heap = []
+        for cid in cluster_ids:
+            indices = self._get_cluster_indices(cid)
+            if indices is None or len(indices) == 0:
+                continue
+
+            local_codes = self._get_cluster_codes(cid)
+
+            if local_codes is None:
+                continue
+
+            n_vecs = min(len(local_codes), len(indices))
+            if n_vecs == 0:
+                continue
+            
+            centroid = self._get_centroid(cid)
+            query_residual = (query - centroid).astype(np.float32)
+            dist = self._compute_pq_distances(query_residual, codebooks, local_codes[:n_vecs])
+            self._update_candidate_heap(candidate_heap, dist, indices, n_vecs, n_take)
+
+        if not candidate_heap:
+            return []
+        
+        candidate_ids = self._get_unique_candidates(candidate_heap)
+        results = self._rerank_candidates(candidate_ids, query, top_k)
+        return results
+
+    def _call_score(self, vec1, vec2):
+        return np.dot(vec1, vec2)
