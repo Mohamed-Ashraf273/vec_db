@@ -157,7 +157,7 @@ class VecDB:
         index_to_centroid = np.zeros((num_records, self.dim), dtype=np.float16)
         cluster_weights = {}
         n_runs = 4 if num_records < 20_000_000 else 2
-        
+
         for cluster_id, indices in inverted_index.items():
             cluster_size = len(indices)
             for idx in indices:
@@ -438,7 +438,10 @@ class VecDB:
         if n <= 1_000_000:
             factor = 14
         elif n <= 10_000_000:
-            factor = 560
+            if top_k > 5:
+                factor = 472
+            else:
+                factor = 560
         else:
             factor = 90
 
