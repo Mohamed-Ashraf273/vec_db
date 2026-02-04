@@ -1,0 +1,74 @@
+
+======================================================================
+VecDB Performance Report
+======================================================================
+
+DATABASE CONFIGURATION
+  Vectors:           1,000,000
+  Dimensions:        64
+  Database path:     saved_db_1M.dat
+  Index path:        index_1M/
+
+======================================================================
+
+QUERY PERFORMANCE (top_k=5)
+  Queries tested:    100
+  
+  Accuracy Metrics:
+    Recall@5:        0.1560 (15.60%)
+    Quality Ratio:   0.9855 (98.55%)
+  
+  Note: Recall = exact matches with true top-5
+        Quality = retrieved similarity / optimal similarity
+  
+  Latency:
+    Mean:            112.56 ms
+    Median:          111.66 ms
+    Min:             75.19 ms
+    Max:             132.96 ms
+    Std Dev:         5.43 ms
+    
+  Percentiles:
+    P50:             111.66 ms
+    P95:             120.87 ms
+    P99:             128.84 ms
+    
+  Throughput:        8.9 queries/second
+
+======================================================================
+
+MEMORY USAGE
+  Per Query:
+    Mean:            0.000 MB
+    Max:             0.010 MB
+    Min:             0.000 MB
+
+======================================================================
+
+DISK STORAGE
+  Database size:     244.14 MB
+  Index size:        9.69 MB
+  Total size:        253.83 MB
+  
+  Raw data size:     244.14 MB (uncompressed)
+  Compression ratio: 0.96x
+  Bytes per vector:  266.16
+
+======================================================================
+
+PERFORMANCE SUMMARY
+
+  🎯 Quality:  Excellent
+             (Retrieved 98.55% as good as optimal)
+             (Recall@5: 0.1560)
+
+  ⚡ Speed:   Good
+             (Mean: 112.56ms, 8.9 QPS)
+  
+  💾 Memory:  Excellent
+             (Avg: 0.00MB per query)
+  
+  🗜️  Storage: Good
+             (0.96x compression)
+
+======================================================================

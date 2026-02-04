@@ -39,10 +39,10 @@ class VecDB:
             self.generate_database(db_size)
     
     def generate_database(self, size: int) -> None:
-        # rng = np.random.default_rng(DB_SEED_NUMBER)
-        # vectors = rng.random((size, DIMENSION), dtype=np.float32)
-        # vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10
-        # self._write_vectors_to_file(vectors)
+        rng = np.random.default_rng(DB_SEED_NUMBER)
+        vectors = rng.random((size, DIMENSION), dtype=np.float32)
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-10
+        self._write_vectors_to_file(vectors)
         self._build_index()
 
     def _write_vectors_to_file(self, vectors: np.ndarray) -> None:
